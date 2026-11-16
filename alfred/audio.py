@@ -24,7 +24,6 @@ import wave
 from pathlib import Path
 
 import numpy as np
-import sounddevice as sd
 from livekit import rtc
 from loguru import logger
 
@@ -57,6 +56,11 @@ class AudioEngine:
             if echo_cancellation
             else None
         )
+        # Imported here, not at the top: importing it starts PortAudio, which fails on a
+        # machine with no sound server (CI). Only the engine needs it.
+        import sounddevice as sd
+
+        self._sd = sd
         self._stream = sd.Stream(
             samplerate=SAMPLE_RATE,
             blocksize=BLOCK_SAMPLES,
@@ -78,7 +82,7 @@ class AudioEngine:
         input_latency, output_latency = self._stream.latency
         # Time from audio leaving us to its echo coming back: the canceller needs this.
         self._delay_ms = round((input_latency + output_latency) * 1000)
-        mic, speaker = (sd.query_devices(i) for i in self._stream.device)
+        mic, speaker = (self._sd.query_devices(i) for i in self._stream.device)
         logger.info(
             f"Audio started: mic '{mic['name']}', speaker '{speaker['name']}', {SAMPLE_RATE} Hz, "
             f"echo cancellation {'ON' if self._echo_canceller else 'OFF'}"
