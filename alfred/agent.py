@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from alfred.apps import Apps
 from alfred.audit import AuditLog
 from alfred.config import PROJECT_ROOT, Config, load_prompt
 from alfred.db import Database, Task
+from alfred.library import Library, answer_page
 from alfred.memory import Memory
 from alfred.permissions import Guard
 from alfred.projects import Projects
@@ -81,12 +83,16 @@ class Agent:
         run: Runner | None = None,
         memory: Memory | None = None,
         apps: Apps | None = None,
+        library: Library | None = None,
     ):
         self._db, self._config, self._questions, self._audit = db, config, questions, audit
         self.projects, self.skills = projects, skills
         self._about_user, self._memory, self._apps = about_user, memory, apps
+        self.library = library
         self._run_agent = run or self._run_claude
-        self._guard = Guard(questions, audit, skills.root, config.tz)
+        self._guard = Guard(
+            questions, audit, skills.root, config.tz, library.root if library else None
+        )
         self._ignore_file = config.data_dir / "gitignore"  # the caches agent work leaves
         self._ignore_file.parent.mkdir(parents=True, exist_ok=True)
         self._ignore_file.write_text(".cache/\n.alfred/\n")
@@ -218,6 +224,7 @@ class Agent:
             + self._about_user()
             + f"\n\n## Where you are\nProject: {project}, folder {folder}. Skills folder: "
             f"{self.skills.folder}. Pages to show the user go in {folder}/.alfred/pages/."
+            + (self.library.contents_text() if self.library else "")
             + (self._memory.lessons_text(project) if self._memory else "")
             + self.projects.instructions(project)
         )
@@ -229,7 +236,15 @@ class Agent:
             plugins=[{"type": "local", "path": str(self.skills.root)}],
             setting_sources=[],  # never a cloned repository's own settings or hooks
             mcp_servers={
-                "alfred": alfred_server(task_id, project, self._questions, self._memory, self._apps)
+                "alfred": alfred_server(
+                    task_id,
+                    project,
+                    self._questions,
+                    self._memory,
+                    self._apps,
+                    self.library,
+                    folder / ".alfred" / "pages",
+                )
             },
             hooks={"PreToolUse": [guard]},
             can_use_tool=refuse_unchecked,
@@ -253,9 +268,12 @@ def alfred_server(
     questions: Questions,
     memory: Memory | None,
     apps: Apps | None = None,
+    library: Library | None = None,
+    pages: Path | None = None,
 ):
-    """The tools Alfred adds: asking you a question out loud, saving a lesson, and
-    starting the project's app so the user can try it."""
+    """The tools Alfred adds: asking you a question out loud, saving a lesson, starting
+    the project's app so the user can try it, and the library's search, reading and
+    citation check."""
 
     @tool(
         "ask_user",
@@ -295,7 +313,94 @@ def alfred_server(
         result = await apps.start(project, args["command"], int(args.get("port") or 0))
         return {"content": [{"type": "text", "text": json.dumps(result)}]}
 
-    return create_sdk_mcp_server("alfred", tools=[ask_user, save_lesson, serve_app])
+    return create_sdk_mcp_server(
+        "alfred", tools=[ask_user, save_lesson, serve_app, *library_tools(library, project, pages)]
+    )
+
+
+def library_tools(library: Library | None, project: str, pages: Path | None) -> list:
+    """The library's tools: list, search, read, and the citation check."""
+
+    def reply(value) -> dict:
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        return {"content": [{"type": "text", "text": text}]}
+
+    @tool("list_documents", "The files in the user's library, and whether each is ready.", {})
+    async def list_documents(_args: dict) -> dict:
+        return reply([d.describe() for d in library.documents()] if library else [])
+
+    @tool(
+        "search_documents",
+        "Search the user's library by keyword and by meaning; returns passages with their "
+        "document and location, best first. Search again with other words when results "
+        "are thin. document: limit to one file (name or id), or empty.",
+        {"query": str, "document": str},
+    )
+    async def search_documents(args: dict) -> dict:
+        if not library:
+            return reply("There is no library here.")
+        found = await library.search(args["query"], args.get("document") or "")
+        return reply(found or "Nothing found: try other words, synonyms or a shorter query.")
+
+    @tool(
+        "read_document",
+        "The full text at a location of a document: 'page 12', '12-14', 'slide 4', "
+        "'sheet Sales', a section heading, or 'lines 81-160'. Read the whole section before "
+        "you answer from it.",
+        {"document": str, "location": str},
+    )
+    async def read_document(args: dict) -> dict:
+        if not library:
+            return reply("There is no library here.")
+        return reply(library.read(args["document"], args["location"]))
+
+    @tool(
+        "cite_answer",
+        "Check an answer from the user's documents before you give it: every claim's "
+        "citation (document, location, an exact quote from that location). Fix or drop "
+        "any citation it rejects, and call it again; give the answer only once all pass.",
+        {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string"},
+                "citations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "document": {"type": "string"},
+                            "location": {"type": "string"},
+                            "quote": {"type": "string"},
+                        },
+                        "required": ["document", "location", "quote"],
+                    },
+                },
+            },
+            "required": ["answer", "citations"],
+        },
+    )
+    async def cite_answer(args: dict) -> dict:
+        if not library:
+            return reply("There is no library here.")
+        citations = list(args.get("citations") or [])
+        problems = library.check(citations)
+        failed = [{"citation": i + 1, "problem": p} for i, p in enumerate(problems) if p]
+        if failed or not citations:
+            why = failed or "an answer from the documents needs at least one citation"
+            return reply({"checked": False, "fix": why})
+        library.record(project, args["answer"], citations)
+        result = {"checked": True}
+        if pages:
+            pages.mkdir(parents=True, exist_ok=True)
+            page = pages / f"answer-{time.strftime('%Y%m%d-%H%M%S')}.html"
+            page.write_text(answer_page(args["answer"], citations, library), encoding="utf-8")
+            result["page"] = f"pages/{project}/{page.name} on the apps page"
+        scanned = [c for c in citations if library.scanned_at(c["document"], c["location"])]
+        if scanned:
+            result["say"] = "Some sources are scanned pages: say 'from the scanned copy'."
+        return reply(result)
+
+    return [list_documents, search_documents, read_document, cite_answer]
 
 
 async def refuse_unchecked(tool_name: str, _input: dict, _context) -> PermissionResultDeny:

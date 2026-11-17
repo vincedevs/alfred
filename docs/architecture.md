@@ -22,6 +22,7 @@ mic ─► wake word ─► GPT-Live (voice) ─► delegate ─► tools ─►
 | Reminders | `reminders` | Reminders, timers and alarms in SQLite; the wake loop speaks up (and rings) when one is due |
 | Skills | `skills` | A git-tracked plugin folder the agent loads natively |
 | Running | `__main__`, `services`, `config`, `logs`, `lock`, `reset` | Start-up, settings, logs |
+| Library | `library`, `web` | Uploaded files (in resumable pieces) read into located text (Claude vision for scans, within limits), hybrid keyword and meaning search, the agent's search, read and citation-check tools |
 | Apps | `apps`, `web` | Running the apps Alfred builds; the apps page listing them, with static sites and pages |
 
 ## A request, end to end

@@ -179,7 +179,8 @@ def test_memory_skills_and_sleep_tools(tmp_path):
         await tools["recall"](params, about="pushes")
         assert params.result["facts"] == ["Prefers direct pushes."]
         await tools["list_skills"](params)
-        assert params.result["skills"][0]["name"] == "writing-skills"
+        names = [skill["name"] for skill in params.result["skills"]]
+        assert {"writing-skills", "answering-from-documents"} <= set(names)
         await tools["sleep"](params)
         assert slept == [1]
 

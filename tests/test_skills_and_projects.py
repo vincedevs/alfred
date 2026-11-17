@@ -1,4 +1,4 @@
-"""Skills (a plugin folder in git, starting with one skill) and projects (folders)."""
+"""Skills (a plugin folder in git, starting with the starter skills) and projects (folders)."""
 
 import json
 import subprocess
@@ -12,15 +12,29 @@ def commits(root):
     return out.stdout.strip().splitlines()
 
 
-def test_skills_start_with_how_to_write_one(tmp_path):
+STARTERS = ["answering-from-documents", "writing-skills"]
+
+
+def test_skills_start_with_the_starter_skills(tmp_path):
     skills = Skills(tmp_path / "skills")
     manifest = json.loads((skills.root / ".claude-plugin" / "plugin.json").read_text())
     assert manifest["name"] == "alfred"
-    assert [s["name"] for s in skills.list()] == ["writing-skills"]
-    assert "teaches you" in skills.list()[0]["use_when"]
+    assert [s["name"] for s in skills.list()] == STARTERS
+    assert "teaches you" in skills.list()[1]["use_when"]
     assert len(commits(skills.root)) == 1
     Skills(skills.root)  # opening it again changes nothing
     assert len(commits(skills.root)) == 1
+
+
+def test_a_new_starter_skill_reaches_an_existing_install_once(tmp_path):
+    skills = Skills(tmp_path / "skills")
+    (skills.root / ".claude-plugin" / "starters.json").write_text('["writing-skills"]')
+    assert skills.remove("answering-from-documents")  # as if it came in a later version
+    Skills(skills.root)
+    assert [s["name"] for s in skills.list()] == STARTERS  # added
+    assert skills.remove("answering-from-documents")
+    Skills(skills.root)
+    assert [s["name"] for s in skills.list()] == ["writing-skills"]  # forgotten stays so
 
 
 def test_new_and_forgotten_skills_are_commits(tmp_path):
@@ -30,7 +44,7 @@ def test_new_and_forgotten_skills_are_commits(tmp_path):
     (deploy / "SKILL.md").write_text("---\nname: deploy-portfolio\ndescription: Deploy it.\n---\n")
     assert skills.commit("Learned deploy-portfolio")
     assert not skills.commit("Nothing changed")
-    assert {s["name"] for s in skills.list()} == {"writing-skills", "deploy-portfolio"}
+    assert {s["name"] for s in skills.list()} == {*STARTERS, "deploy-portfolio"}
     assert skills.remove("deploy-portfolio") and not skills.remove("deploy-portfolio")
     assert not skills.remove("../..")  # only a skill's own folder
     assert len(commits(skills.root)) == 3

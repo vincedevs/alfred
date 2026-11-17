@@ -2,9 +2,48 @@
 
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## 1.1.0 (unreleased)
+
+### Added
+- **The library: answers from your own files, with checked citations.** Upload files on
+  the apps page (`/library`); they are read in the background, page by page, and are
+  searchable as they go. PDF text, Word, PowerPoint, Excel, CSV, EPUB, HTML, Outlook
+  messages, text and code; scanned pages and images are read by Claude vision
+  (`ALFRED_VISION_MODEL`). Same file twice is skipped; a new version replaces the old.
+- Uploads go in 8 MB pieces and resume after a dropped connection; several files or a
+  whole folder at once, two at a time; asks before replacing a file of the same name.
+  Files up to 500 MB (100 MB for Word, PowerPoint, EPUB and web pages), 64 GB in all, and
+  the card always keeps 10 GB free. Spreadsheets and text are read in batches, whatever
+  their size; small files are read before large ones.
+- Scans under control: a file with more than 200 scanned pages waits for your yes (on the
+  page, or by voice), and at most 1,000 scanned pages are read a day; the rest carry on
+  the next day.
+- **Hybrid search:** keyword search plus meaning search (OpenAI `text-embedding-3-large`,
+  1,024 numbers per chunk, embedded with its document and location, in `sqlite-vec`),
+  their rankings merged. Offline, keyword search carries on and embeddings catch up later;
+  a new embedding model re-embeds the library. Past 40 files, prompts get a summary of the
+  library instead of every name.
+- The agent searches, reads whole pages and sections,
+  calculates spreadsheet figures in code, and checks every citation with `cite_answer`:
+  each quote must be at the location it cites, or it isn't spoken. The full answer, with
+  quotes and links to the page, goes on the apps page.
+- A starter skill, `answering-from-documents`; starter skills added in later versions
+  now reach existing installs (once).
+- "What's in my library?" by voice; Alfred says when an uploaded file is ready. He knows
+  which files the library holds, so a question they may answer goes to them first, even
+  when you don't mention a file.
+- The apps page, the library and answer pages share one design, a manor at night
+  (midnight and candlelight, with a daylight version in light mode), with Alfred's bow-tie
+  logo in the header, as the browser tab's icon and in the README: upload progress per
+  file, live status while files are read, type, size and page counts.
+
+### Removed
+- The `benchmark/` folder. How to run the voice benchmark (fd-benchmark) is now in
+  `docs/benchmarking.md`, with the one file it needs.
+
 ## 1.0.0 (2026-11-16)
 
-Alfred, a general-purpose voice agent with the manner of an English
+The first release: Alfred, a general-purpose voice agent with the manner of an English
 butler, built for coding, running on a Raspberry Pi 5.
 
 ### Voice

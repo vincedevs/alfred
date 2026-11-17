@@ -71,6 +71,7 @@ async def run(config: Config) -> None:
             job.cancel()
         await services.agent.close()  # unfinished tasks carry on next start
         await services.apps.stop_all()
+        await services.library.stop()
         if services.web:
             services.web.stop()
         services.db.close()

@@ -1,6 +1,6 @@
 [project]
 name = "alfred"
-version = "1.0.0"
+version = "1.1.0"
 description = "Alfred: a general-purpose voice agent for the Raspberry Pi 5, built for coding"
 readme = "README.md"
 authors = [{ name = "Vince Duero", email = "vince.duero@gmail.com" }]
@@ -14,6 +14,11 @@ dependencies = [
     "numpy>=1.26",
     "loguru>=0.7",                    # same logger Pipecat uses, so all logs look alike
     "python-dotenv>=1.0",
+    "pypdfium2>=5.15.2",
+    "markitdown[docx,outlook,pptx,xls,xlsx]>=0.1.9",
+    "pillow>=13.0.0",
+    "sqlite-vec>=0.1.9",
+    "openpyxl>=3.1.5",
 ]
 
 [project.scripts]
@@ -22,7 +27,11 @@ alfred-reset = "alfred.reset:main"
 alfred-memory = "alfred.memory:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.12"]
+dev = [
+    "fpdf2>=2.9.0",
+    "pytest>=8",
+    "ruff>=0.12",
+]
 
 [build-system]
 requires = ["uv_build>=0.9,<0.14"]

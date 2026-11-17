@@ -162,3 +162,13 @@ def test_starting_an_app_is_asked_first(places):
     decision = decide("mcp__alfred__serve_app", {"command": "npm run dev", "port": 0}, *places)
     assert decision.action == "ask" and "npm run dev" in decision.reason
     assert decision.kind == "app"  # "always" works for it
+
+
+def test_the_library_is_read_only_and_its_tools_are_free(places, tmp_path):
+    library = tmp_path / "library"
+    (library / "files").mkdir(parents=True)
+    sheet = str(library / "files" / "abc.xlsx")
+    assert decide("Read", {"file_path": sheet}, *places, library).action == "allow"
+    assert decide("Write", {"file_path": sheet}, *places, library).action == "deny"
+    for name in ("list_documents", "search_documents", "read_document", "cite_answer"):
+        assert decide(f"mcp__alfred__{name}", {}, *places).action == "allow"

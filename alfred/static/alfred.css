@@ -1,0 +1,149 @@
+/* Alfred's pages: the apps page, the library and answers. A gentleman's manor at night:
+   a midnight study, silverware, and candlelight gold for the one accent (his bow tie, and
+   the salver you hand him files on). In daylight (light mode) the same house by day. */
+:root {
+  --paper: #10141f;      /* the midnight study */
+  --sheet: #171d2b;      /* panelling */
+  --ink: #e4e7ec;        /* silverware */
+  --quiet: #9aa3b2;
+  --rule: #273046;
+  --livery: #c9ced6;
+  --brass: #d4af6a;      /* candlelight */
+  --brass-soft: #2c2719;
+  --glow: rgba(212, 175, 106, 0.16);
+  --ready: #6e9b83;      /* ivy */
+  --failed: #d07a7a;     /* oxblood, lit */
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color-scheme: dark light;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --paper: #f1efe9;
+    --sheet: #fbfaf7;
+    --ink: #161b28;
+    --quiet: #5b6272;
+    --rule: #dcd8ce;
+    --livery: #1f2a44;
+    --brass: #9a7a35;
+    --brass-soft: #efe5cc;
+    --glow: rgba(154, 122, 53, 0.12);
+    --ready: #4f7a63;
+    --failed: #8a3b3b;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 16px/1.5 var(--sans);
+}
+a { color: var(--livery); text-underline-offset: 3px; }
+a:hover { color: var(--brass); }
+:focus-visible { outline: 3px solid var(--brass); outline-offset: 2px; border-radius: 4px; }
+
+/* The household bar: his bow tie, his name, the rooms */
+.bar {
+  display: flex; align-items: center; gap: 28px; flex-wrap: wrap;
+  max-width: 920px; margin: 0 auto; padding: 22px 24px 18px; border-bottom: 1px solid var(--rule);
+}
+.mark {
+  display: inline-flex; align-items: center; gap: 12px;
+  font: 500 28px/1 var(--serif); color: var(--ink); text-decoration: none; letter-spacing: 0.04em;
+}
+.mark img { width: 40px; height: 40px; }
+.signature { margin-top: 48px; color: var(--quiet); font: italic 15px/1.4 var(--serif); text-align: center; }
+.mark:hover { color: var(--ink); }
+.bar nav { display: flex; gap: 20px; }
+.bar nav { margin-left: auto; }
+.bar nav a { color: var(--quiet); text-decoration: none; padding-bottom: 4px; border-bottom: 2px solid transparent; }
+.bar nav a[aria-current="page"] { color: var(--ink); border-bottom-color: var(--brass); }
+
+main { max-width: 920px; margin: 0 auto; padding: 28px 24px 64px; }
+h1 { font: 500 40px/1.15 var(--serif); margin: 8px 0 6px; letter-spacing: 0.01em; }
+h2 { font: 600 20px/1.3 var(--serif); margin: 40px 0 10px; }
+.lead { color: var(--quiet); margin: 0 0 20px; max-width: 62ch; }
+
+/* Lists of things: plain rows on a sheet, not cards */
+.sheet { background: var(--sheet); border: 1px solid var(--rule); border-radius: 10px; }
+.rows { list-style: none; margin: 0; padding: 0; }
+.rows li {
+  display: grid; grid-template-columns: 1fr auto; gap: 4px 16px; align-items: center;
+  padding: 14px 18px; border-top: 1px solid var(--rule);
+}
+.rows li:first-child { border-top: 0; }
+.rows .name { font-weight: 600; overflow-wrap: anywhere; }
+.rows .meta { color: var(--quiet); font-size: 14px; grid-column: 1; }
+.rows .side { grid-row: 1 / span 2; grid-column: 2; display: flex; gap: 10px; align-items: center; }
+.empty { color: var(--quiet); padding: 18px; margin: 0; }
+
+.status { font-size: 14px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--quiet); }
+.status.ready::before, .status.running::before { background: var(--ready); }
+.status.failed::before, .status.stopped::before { background: var(--failed); }
+.status.processing::before, .status.waiting::before, .status.paused::before { background: var(--brass); }
+.status.asking { color: var(--brass); font-weight: 600; }
+.status.asking::before { background: var(--brass); box-shadow: 0 0 0 3px var(--brass-soft); }
+
+.kind {
+  font-size: 12px; font-weight: 600; color: var(--livery); background: var(--paper);
+  border: 1px solid var(--rule); border-radius: 4px; padding: 1px 6px; margin-right: 8px;
+}
+.progress { height: 4px; background: var(--rule); border-radius: 2px; overflow: hidden; margin-top: 6px; grid-column: 1; }
+.progress span { display: block; height: 100%; background: var(--brass); transition: width 0.3s ease; }
+.note { color: var(--quiet); font-size: 13px; grid-column: 1; }
+
+button {
+  font: inherit; font-size: 14px; color: var(--ink); background: transparent; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 6px; padding: 5px 12px;
+}
+button:hover { border-color: var(--livery); }
+button.danger:hover { border-color: var(--failed); color: var(--failed); }
+button.primary { background: var(--brass); border-color: var(--brass); color: var(--paper); font-weight: 600; }
+button.primary:hover { filter: brightness(1.08); }
+button.link { border: 0; padding: 0; color: var(--livery); text-decoration: underline; text-underline-offset: 3px; font-size: inherit; }
+.space { color: var(--quiet); font-size: 14px; text-align: center; margin: 0 0 8px; }
+
+/* The salver: the one memorable thing. Silver, lit warmly from within. */
+.tray {
+  display: block; width: 100%; margin: 24px 0 8px; padding: 46px 24px; text-align: center; cursor: pointer;
+  background:
+    radial-gradient(ellipse at 50% 40%, var(--glow), transparent 70%),
+    radial-gradient(ellipse at 50% 30%, var(--sheet), var(--paper) 80%);
+  border: 2px solid var(--brass); border-radius: 999px / 130px;
+  box-shadow: inset 0 0 0 7px var(--paper), inset 0 0 0 8px var(--brass-soft), 0 0 48px -12px var(--glow);
+  color: var(--ink); font: inherit;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.tray img { width: 44px; height: 44px; display: block; margin: 0 auto 10px; }
+.tray strong { display: block; font: 500 27px/1.2 var(--serif); margin-bottom: 6px; letter-spacing: 0.01em; }
+.tray span { display: block; color: var(--quiet); font-size: 15px; }
+.tray .formats { font-size: 13px; margin-top: 4px; }
+.tray:hover, .tray.over {
+  box-shadow: inset 0 0 0 7px var(--paper), inset 0 0 0 8px var(--brass), 0 0 64px -8px var(--glow);
+}
+.tray.over { transform: scale(1.01); }
+.tray:hover { color: var(--ink); border-color: var(--brass); }
+.hint { color: var(--quiet); font-size: 14px; text-align: center; margin: 0 0 8px; }
+
+/* An answer from the library: what he said, then each quote with its source */
+.said { padding: 18px 20px; font: 19px/1.55 var(--serif); max-width: 70ch; }
+.sources { padding-left: 24px; }
+.sources li { margin: 0 0 18px; padding-left: 4px; }
+.sources li::marker { color: var(--brass); font-weight: 600; }
+.sources blockquote {
+  margin: 0 0 6px; padding: 2px 0 2px 16px; border-left: 3px solid var(--brass);
+  font: italic 17px/1.55 var(--serif); max-width: 68ch;
+}
+.sources cite { font-style: normal; font-size: 14px; color: var(--quiet); }
+
+@media (max-width: 560px) {
+  h1 { font-size: 30px; }
+  .rows li { grid-template-columns: 1fr; }
+  .rows .side { grid-row: auto; grid-column: 1; }
+  .tray { padding: 32px 16px; border-radius: 28px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}

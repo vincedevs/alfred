@@ -12,6 +12,7 @@ from pipecat.services.llm_service import FunctionCallParams
 from alfred.agent import Agent
 from alfred.apps import Apps
 from alfred.db import Database, Task
+from alfred.library import Library
 from alfred.memory import Memory
 from alfred.questions import Questions
 from alfred.reminders import Reminders
@@ -27,6 +28,7 @@ def delegate_tools(
     reminders: Reminders,
     apps: Apps,
     go_to_sleep: Callable[[], None],
+    library: Library | None = None,
 ) -> list:
     async def do_task(params: FunctionCallParams, request: str, project: str = ""):
         """Hand work to the agent: anything beyond a quick web search. It can read, write
@@ -174,6 +176,23 @@ def delegate_tools(
         """
         await params.result_callback(await apps.restart(project))
 
+    async def list_documents(params: FunctionCallParams):
+        """The files in the user's library (uploaded on the apps page), and whether each is
+        ready. Questions about what they say go to do_task."""
+        docs = [d.describe() for d in library.documents()] if library else []
+        await params.result_callback({"documents": docs})
+
+    async def read_large_scan(params: FunctionCallParams, document: str):
+        """The user said yes to reading a file with many scanned pages (it uses their Claude
+        plan): it goes back in the queue.
+
+        Args:
+            document: The file's name, as list_documents gives it.
+        """
+        doc = library.approve(document) if library else None
+        result = {"reading": doc.name} if doc else {"error": "no file is waiting for a yes"}
+        await params.result_callback(result)
+
     async def list_skills(params: FunctionCallParams):
         """The skills Alfred has learned, and when each is used."""
         await params.result_callback({"skills": agent.skills.list()})
@@ -196,7 +215,8 @@ def delegate_tools(
     return [
         do_task, task_status, answer_task, stop_task,
         remember, recall, forget, remind, list_reminders, cancel_reminder,
-        list_apps, stop_app, restart_app, list_skills, forget_skill, sleep,
+        list_apps, stop_app, restart_app, list_documents, read_large_scan,
+        list_skills, forget_skill, sleep,
     ]  # fmt: skip
 
 

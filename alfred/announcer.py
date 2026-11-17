@@ -13,6 +13,7 @@ from pipecat.services.openai.live import events as live_events
 
 from alfred.agent import Agent
 from alfred.db import Database, Question, Reminder, Task
+from alfred.library import Document, Library
 from alfred.questions import Questions
 from alfred.reminders import Reminders
 
@@ -28,9 +29,10 @@ class Announcer:
         questions: Questions,
         reminders: Reminders,
         ring: Callable[[list[Reminder]], None] = lambda _due: None,
+        library: Library | None = None,
     ):
         self._llm, self._db, self._agent, self._questions = llm, db, agent, questions
-        self._reminders, self._ring = reminders, ring
+        self._reminders, self._ring, self._library = reminders, ring, library
         self._watching: asyncio.Task | None = None
         self.session_open = False
         self.closing = False  # the session is ending: news waits for the next one
@@ -39,12 +41,29 @@ class Announcer:
         self._agent.on_finished.append(self._finished)
         self._questions.on_asked.append(self._asked)
         self._watching = asyncio.create_task(self._watch_reminders())
+        if self._library:
+            self._library.on_ready.append(self._document_ready)
+            self._library.on_asking.append(self._document_asks)
 
     def stop(self) -> None:
         self._agent.on_finished.remove(self._finished)
         self._questions.on_asked.remove(self._asked)
         if self._watching:
             self._watching.cancel()
+        if self._library:
+            self._library.on_ready.remove(self._document_ready)
+            self._library.on_asking.remove(self._document_asks)
+
+    def _document_asks(self, doc: Document) -> None:
+        if self.session_open and not self.closing:
+            self.tell(
+                f"The user's file {doc.name} needs a yes before it is read: {doc.note} "
+                f"Ask them; if they say yes, call read_large_scan. {RULES}"
+            )
+
+    def _document_ready(self, doc: Document) -> None:
+        if self.session_open and not self.closing:
+            self.tell(f"The user's file {doc.name} is now ready to ask about. Say so briefly.")
 
     async def _watch_reminders(self) -> None:
         """A reminder due while you talk is said at once; one due as the session ends

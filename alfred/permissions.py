@@ -1,8 +1,8 @@
 """What the agent may do: three rules, decided in plain code before every tool call, so
 nothing the agent reads (a web page, a README) can change them.
 
-    free    work inside the current project, the web, reading skills, local git, any
-            other sandboxed command
+    free    work inside the current project, the web, reading skills and the library,
+            local git, any other sandboxed command
     ask     anything public or hard to undo: pushing, publishing, merging, deleting
             files, installing system software, sending data out, saving a skill
     never   secrets outside the project (keys, SSH, Alfred's own settings), sudo,
@@ -28,9 +28,12 @@ from alfred.config import PROJECT_ROOT
 from alfred.questions import Questions, is_always, is_yes
 
 FREE_TOOLS = {"WebSearch", "WebFetch", "Skill", "TodoWrite", "TaskStop"} | {
-    "mcp__alfred__ask_user",
-    "mcp__alfred__save_lesson",
-}
+    f"mcp__alfred__{name}"
+    for name in (
+        "ask_user", "save_lesson",
+        "list_documents", "search_documents", "read_document", "cite_answer",
+    )
+}  # fmt: skip
 FILE_TOOLS = {"Read", "Write", "Edit", "Glob", "Grep", "NotebookEdit"}
 WRITE_TOOLS = {"Write", "Edit", "NotebookEdit"}
 NEVER = re.compile(
@@ -68,11 +71,13 @@ class Decision:
     kind: str = ""  # ask: what an "always" answer covers (push, delete, skill...)
 
 
-def decide(tool: str, tool_input: dict, project: Path, skills: Path) -> Decision:
+def decide(
+    tool: str, tool_input: dict, project: Path, skills: Path, library: Path | None = None
+) -> Decision:
     if tool in FREE_TOOLS:
         return Decision("allow", "free")
     if tool in FILE_TOOLS:
-        return _decide_file(tool, tool_input, project, skills)
+        return _decide_file(tool, tool_input, project, skills, library)
     if tool == "Bash":
         return _decide_command(tool_input)
     if tool == "mcp__alfred__serve_app":  # runs outside the sandbox
@@ -80,7 +85,9 @@ def decide(tool: str, tool_input: dict, project: Path, skills: Path) -> Decision
     return Decision("ask", f"use {tool} with {str(tool_input)[:150]}", f"tool {tool}")
 
 
-def _decide_file(tool: str, tool_input: dict, project: Path, skills: Path) -> Decision:
+def _decide_file(
+    tool: str, tool_input: dict, project: Path, skills: Path, library: Path | None
+) -> Decision:
     pattern = tool_input.get("pattern" if tool == "Glob" else "glob") or ""
     if pattern.startswith(("/", "~")) or ".." in pattern:
         return Decision("deny", "file searches stay inside the project")
@@ -93,6 +100,8 @@ def _decide_file(tool: str, tool_input: dict, project: Path, skills: Path) -> De
             return Decision("allow", "reading a skill")
         name = path.relative_to(skills.resolve()).parts[1:2] or ("skills",)
         return Decision("ask", f"save what I learned as the {name[0]} skill", "skill")
+    if library and path.is_relative_to(library.resolve()) and tool not in WRITE_TOOLS:
+        return Decision("allow", "reading the user's library")
     alfreds_own = path.is_relative_to(skills.resolve().parent) or path.is_relative_to(PROJECT_ROOT)
     if alfreds_own or path.name.startswith(".env") or NEVER.search(str(path)):
         return Decision("deny", "secrets and Alfred's own files are off limits")
@@ -116,9 +125,16 @@ def _decide_command(tool_input: dict) -> Decision:
 class Guard:
     """Checks every tool call the agent makes (the SDK's PreToolUse hook)."""
 
-    def __init__(self, questions: Questions, audit: AuditLog, skills: Path, tz: ZoneInfo):
+    def __init__(
+        self,
+        questions: Questions,
+        audit: AuditLog,
+        skills: Path,
+        tz: ZoneInfo,
+        library: Path | None = None,
+    ):
         self._questions, self._audit = questions, audit
-        self._skills, self._tz = skills, tz
+        self._skills, self._tz, self._library = skills, tz, library
         self._declined: set[tuple[int, str]] = set()  # (task, action) you said no to
         self._always: dict[tuple[str, str], date] = {}  # (project, kind) -> the day allowed
         self.refused: set[str] = set()  # tool calls refused here
@@ -144,7 +160,7 @@ class Guard:
         self, task_id: int, project: Path, tool: str, tool_input: dict
     ) -> tuple[bool, str]:
         """Returns (may it run, what the agent is told)."""
-        decision = decide(tool, tool_input, project, self._skills)
+        decision = decide(tool, tool_input, project, self._skills, self._library)
         allowed, outcome = decision.action == "allow", decision.action
         if decision.action == "ask":
             allowed, outcome = await self._ask(task_id, (str(project), decision.kind), decision)

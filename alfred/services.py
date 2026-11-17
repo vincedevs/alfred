@@ -9,6 +9,7 @@ from alfred.apps import Apps
 from alfred.audit import AuditLog
 from alfred.config import Config
 from alfred.db import Database
+from alfred.library import Library, Limits, claude_vision, openai_embedder
 from alfred.memory import Memory
 from alfred.projects import Projects
 from alfred.questions import Questions
@@ -26,6 +27,7 @@ class Services:
     agent: Agent
     reminders: Reminders
     apps: Apps
+    library: Library
     web: WebShare | None = None  # the apps page (web.py)
 
     @classmethod
@@ -36,7 +38,20 @@ class Services:
         memory = Memory(db, config)
         projects = Projects(config.projects_dir)
         apps = Apps(projects, lambda port: f"http://{lan_ip()}:{port}/")
-        web = start_web(projects, apps, config.web_port)
+        library = Library(
+            config.library_dir,
+            claude_vision(config.vision_model or config.agent_model),
+            Limits(
+                config.library_max_mb,
+                config.library_max_gb,
+                config.vision_ask_pages,
+                config.vision_daily_pages,
+            ),
+            openai_embedder(config.openai_api_key, config.embedding_model),
+            config.embedding_model,
+        )
+        library.start()
+        web = start_web(projects, apps, config.web_port, library)
         pages = web.address_text() if web else ""
         agent = Agent(
             db,
@@ -48,10 +63,13 @@ class Services:
             about_user=lambda: memory.prompt_text() + pages,
             memory=memory,
             apps=apps,
+            library=library,
         )
         if resumed := agent.resume_unfinished():
             logger.info(f"Carrying on with {resumed} unfinished task(s)")
-        return cls(config, db, questions, memory, agent, Reminders(db, config.tz), apps, web)
+        return cls(
+            config, db, questions, memory, agent, Reminders(db, config.tz), apps, library, web
+        )
 
     def has_news(self) -> bool:
         """Is there anything Alfred should speak up about?"""

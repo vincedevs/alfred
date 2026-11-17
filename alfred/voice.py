@@ -78,7 +78,14 @@ class Conversation:
         opening, self._told, self._said = opening_messages(s.db, s.questions, s.reminders)
         self._has_news = bool(opening)
         tools = delegate_tools(
-            s.agent, s.db, s.questions, s.memory, s.reminders, s.apps, self._go_to_sleep
+            s.agent,
+            s.db,
+            s.questions,
+            s.memory,
+            s.reminders,
+            s.apps,
+            self._go_to_sleep,
+            library=s.library,
         )
         context = LLMContext(
             messages=opening,
@@ -101,7 +108,7 @@ class Conversation:
             s.config,
         )
         self.announcer = Announcer(
-            self.llm, s.db, s.agent, s.questions, s.reminders, ring=self._ring
+            self.llm, s.db, s.agent, s.questions, s.reminders, ring=self._ring, library=s.library
         )
         self._rings = {
             k: load_sound(PROJECT_ROOT / "sounds" / f"{f}.wav") for k, f in RINGS.items()
@@ -201,9 +208,10 @@ class Conversation:
 
 def background(services: Services) -> tuple[str, str]:
     """Added to GPT-Live's and the delegate's instructions: the time and place, what
-    Alfred knows about the user, recent tasks, projects and the apps page."""
+    Alfred knows about the user, the files in his library, recent tasks, projects and the
+    apps page."""
     s = services
-    shared = s.config.context_text() + s.memory.prompt_text()
+    shared = s.config.context_text() + s.memory.prompt_text() + s.library.contents_text()
     projects = ", ".join(s.agent.projects.names()) or "none yet"
     delegate = shared + f"\n\n## Projects\n{projects}"
     if s.web:
