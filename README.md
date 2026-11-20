@@ -21,7 +21,7 @@ saves it (after asking) and uses it next time.
   "Every weekday at 8:45, remind me about stand-up."
 - "Make a snake game I can play on my phone." He builds it, starts it and says where to
   open it. "What's running?" "Stop the game."
-- Upload files at `http://<pi>:8080/library`, then: "What's the notice period in my lease?"
+- Drop files, a folder or a zip at `http://<pi>:8080/library`, then: "What's the notice period in my lease?"
   "What were total sales in March?" He answers with the page, and puts the full answer,
   with quotes, on the apps page. Every quote is checked against the file first.
 - "How's it going?" "Stop that." "Go to sleep."
@@ -53,22 +53,19 @@ How it works: [docs/architecture.md](docs/architecture.md).
 
 ## Setup
 
-You need [uv](https://docs.astral.sh/uv/), an OpenAI API key (`gpt-live-1`, `gpt-6-luna`),
-and a Claude sign-in (your Claude plan via `claude setup-token`, or an API key). For
-GitHub: `git`, the [GitHub CLI](https://cli.github.com/) and a fine-grained token.
+You need an OpenAI API key (`gpt-live-1`, `gpt-6-luna`) and a Claude sign-in (your Claude
+plan via `claude setup-token`, or an API key); for GitHub, a fine-grained token. Then, on
+the Raspberry Pi or a Mac:
 
 ```bash
-uv sync
-cp .env.example .env    # then fill in your keys
+./setup.sh
 ```
 
-On the Raspberry Pi, the agent's shell needs the sandbox tools:
-
-```bash
-sudo apt install bubblewrap socat git gh portaudio19-dev
-```
-
-On a Mac, allow microphone access for your terminal when asked.
+It installs only what is missing: [uv](https://docs.astral.sh/uv/) and the Python
+packages, the agent's sandbox (`bubblewrap`, `socat`; built into macOS), `git` and the
+GitHub CLI, PortAudio, and LibreOffice for old Office files (`--no-office` skips it). It
+makes `.env` from `.env.example` and says which keys are missing. `--service` (Linux)
+starts Alfred at boot. On a Mac, allow microphone access for your terminal when asked.
 
 ## Run
 

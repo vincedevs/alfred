@@ -5,7 +5,9 @@ Each file becomes text with locations a citation can point to: `page 12`, `slide
 `sheet Sales, rows 1-500`, `§ 14. Termination`, `lines 1-80`. PDF text comes straight from
 the file (pypdfium2), a page at a time; scanned pages and images are transcribed by Claude
 vision (marked scanned), after a yes for a large scan and within a daily page limit;
-spreadsheets are read row by row; Word, PowerPoint, EPUB and HTML go through MarkItDown.
+spreadsheets are read row by row; Word, PowerPoint, EPUB and HTML go through MarkItDown,
+with the pictures in Word and PowerPoint files read by vision. Old Office formats are
+converted by LibreOffice first. A zip is unpacked into its files.
 
 The text is cut into chunks labelled with their document and location, and found two ways
 (hybrid search): by keyword (SQLite FTS5, with stemming: "terminate" finds "termination")
@@ -17,6 +19,7 @@ Everything lives in ~/.alfred/library: the files, and library.db.
 """
 
 import asyncio
+import codecs
 import csv
 import difflib
 import hashlib
@@ -26,11 +29,15 @@ import re
 import shutil
 import sqlite3
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import time
+import zipfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from itertools import zip_longest
 from pathlib import Path
 
 from loguru import logger
@@ -42,6 +49,11 @@ IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 MARKDOWN = {".docx", ".pptx", ".xls", ".html", ".htm", ".epub", ".msg"}
 ROWS = {".xlsx", ".xlsm", ".csv"}  # read row by row: any size
 SPREADSHEETS = ROWS | {".xls"}
+CONVERT = {".doc": "docx", ".rtf": "docx", ".odt": "docx", ".ppt": "pptx", ".odp": "pptx",
+           ".ods": "xlsx"}  # fmt: skip
+TEXT = {".txt", ".md", ".markdown", ".json", ".xml", ".yaml", ".yml", ".log", ".tsv", ".ini"}
+PICTURE_BYTES_AT_LEAST = 8000  # smaller ones are icons and logos
+ZIP_FILES_AT_MOST = 5000
 WHOLE_FILE_MB = 100  # MarkItDown reads a file whole: Word, PowerPoint, EPUB, HTML, .xls
 KEEP_FREE_GB = 10  # the card always keeps this much free
 PAGES_AT_ONCE = 8  # PDF pages read per step; each step is searchable when done
@@ -109,6 +121,10 @@ class Refused(ValueError):
     """An upload the library won't take: too large, or no room. The message says why."""
 
 
+class Unreadable(Exception):
+    """A file Alfred can't read. The message says why, for the library page."""
+
+
 @dataclass
 class Limits:
     max_mb: float = 500  # per file
@@ -134,13 +150,31 @@ class Document:
     def suffix(self) -> str:
         return Path(self.name).suffix.lower()
 
-    def describe(self) -> dict:
+    @property
+    def converted(self) -> Path | None:
+        """Where LibreOffice's modern copy of an old Office file goes."""
+        to = CONVERT.get(self.suffix)
+        return Path(self.path).with_name(f"{self.id}.converted.{to}") if to else None
+
+    @property
+    def readable(self) -> str:
+        """The file to open: the converted copy of an old Office file, else the file."""
+        copy = self.converted
+        return str(copy) if copy and copy.exists() else self.path
+
+    @property
+    def media(self) -> Path:
+        """Where the pictures read from a Word or PowerPoint file go, as <part>.png."""
+        return Path(self.path).with_name(f"{self.id}.media")
+
+    def describe(self, with_file: bool = True) -> dict:
+        """with_file: for the agent, to calculate from or to look at a page or picture."""
         progress = f"{self.done} of {self.total}" if self.status in ("processing", "paused") else ""
         return (
             {"document": self.name, "id": self.id, "status": self.status}
             | ({"progress": progress} if progress else {})
             | ({"note": self.note} if self.note else {})
-            | ({"file": self.path} if self.suffix in SPREADSHEETS else {})  # to calculate from
+            | ({"file": self.readable} if with_file else {})
         )
 
 
@@ -177,8 +211,11 @@ class Library:
         self._queued: set[str] = set()
         self._order = 0
         self._worker: asyncio.Task | None = None
+        self._embedding: set[asyncio.Task] = set()  # meaning search catches up behind reading
+        self._embed_slots = asyncio.Semaphore(2)
         self.on_ready: list[Callable[[Document], None]] = []
         self.on_asking: list[Callable[[Document], None]] = []  # a large scan needs a yes
+        self.on_change: list[Callable[[], None]] = []  # files added or removed
 
     @property
     def max_bytes(self) -> int:
@@ -239,12 +276,12 @@ class Library:
         docs = self.documents()
         for test in (
             lambda d: d.id == ref or d.name.lower() == ref,
-            lambda d: Path(d.name).stem.lower() == ref,
+            lambda d: Path(d.name).name.lower() == ref or Path(d.name).stem.lower() == ref,
             lambda d: ref and ref in d.name.lower(),
             lambda d: set(words_in(ref)) & set(words_in(Path(d.name).stem)),
         ):
             if found := [d for d in docs if test(d)]:
-                return found[0]
+                return found[0] if len(found) == 1 else None  # several: never guess
         return None
 
     def contents_text(self) -> str:
@@ -255,7 +292,9 @@ class Library:
             return ""
         intro = (
             "\n\n## The user's files (the library)\nQuestions these may answer, even when "
-            "the user doesn't mention a file, are answered from them first.\n"
+            "the user doesn't mention a file, are answered from them first."
+            + (f" {waiting}." if (waiting := self.waiting_text()) else "")
+            + "\n"
         )
         if len(docs) <= LISTED_IN_PROMPTS:
             return intro + "\n".join(f"- {doc.name}{brief(doc)}" for doc in docs)
@@ -272,6 +311,18 @@ class Library:
             + "\nFind the rest with list_documents and search_documents."
         )
 
+    def waiting_text(self) -> str:
+        """Files not ready yet, by what they wait for: "2 still being read, 1 waiting for
+        the user's yes on the library page"."""
+        why = {"waiting": "still being read", "processing": "still being read",
+               "asking": "waiting for the user's yes on the library page",
+               "paused": "waiting for tomorrow's scan limit"}  # fmt: skip
+        counts: dict[str, int] = {}
+        for doc in self.documents():
+            if doc.status in why:
+                counts[why[doc.status]] = counts.get(why[doc.status], 0) + 1
+        return ", ".join(f"{n} {what}" for what, n in counts.items())
+
     def space(self) -> dict:
         """What the library holds, what it may hold, and what the card has free."""
         used = sum(d.bytes for d in self.documents())
@@ -284,7 +335,7 @@ class Library:
         """Raises Refused, with the reason, for a file the library can't take."""
         suffix = Path(name).suffix.lower()
         cap = WHOLE_FILE_MB if suffix in MARKDOWN else self.limits.max_mb
-        if size > cap * 1024 * 1024:
+        if size > cap * 1024 * 1024 and suffix != ".zip":  # a zip's files are checked one by one
             why = (
                 " (Word, PowerPoint, EPUB and web pages are read whole)"
                 if cap == WHOLE_FILE_MB
@@ -329,11 +380,16 @@ class Library:
             out.write(data)
         return self.add_file(name, Path(temp), replace)
 
-    def add_file(self, name: str, path: Path, replace: bool = False) -> tuple[Document, str]:
+    def add_file(
+        self, name: str, path: Path, replace: bool = False, notify: bool = True
+    ) -> tuple[Document | None, str]:
         """Keep a received file and queue it. Returns the document and what happened:
         added, already there (same contents), replaced, or exists (same name, different
-        contents, and `replace` not given: nothing is done)."""
-        name = Path(name).name.strip() or "untitled"
+        contents, and `replace` not given: nothing is done). A zip is unpacked instead."""
+        name = "/".join(p for p in re.split(r"[\\/]+", name.strip()) if p not in ("", ".", ".."))
+        name = name or "untitled"
+        if name.lower().endswith(".zip"):
+            return None, self._unpack(name, path, replace)
         digest = hashlib.sha256()
         with path.open("rb") as data:
             while block := data.read(1 << 20):
@@ -342,7 +398,10 @@ class Library:
         if existing := self.get(doc_id):
             path.unlink(missing_ok=True)
             return existing, "already there"
-        same_name = [d for d in self.documents() if d.name.lower() == name.lower()]
+        same_name = [
+            Document(**dict(r))
+            for r in self._sql("SELECT * FROM documents WHERE lower(name) = lower(?)", (name,))
+        ]
         if same_name and not replace:
             path.unlink(missing_ok=True)
             return same_name[0], "exists"
@@ -356,8 +415,96 @@ class Library:
             (doc_id, name, str(final), time.time(), final.stat().st_size),
         )
         self._enqueue(doc_id)
+        if notify:
+            self._changed()
         logger.info(f"Library: {name} {'replaced' if same_name else 'added'}")
         return self.get(doc_id), "replaced" if same_name else "added"
+
+    def _unpack(self, name: str, path: Path, replace: bool) -> str:
+        """Each file in a zip, added on its own and named by its path inside it (a zip in
+        it too, one level down). Sizes are checked before anything is written, and again
+        while unpacking, in case the zip lies. Returns what happened, for the page."""
+        counts: dict[str, int] = {}
+        try:
+            self._unpack_into(name, path, replace, counts, prefix="", depth=0)
+        finally:
+            self._changed()
+        return f"{name}: " + (", ".join(f"{n} {what}" for what, n in counts.items()) or "empty")
+
+    def _unpack_into(self, name, path: Path, replace, counts, prefix: str, depth: int) -> None:
+        try:
+            with zipfile.ZipFile(path) as archive:
+                members = [m for m in archive.infolist() if not m.is_dir() and not junk(m.filename)]
+                total, room = sum(m.file_size for m in members), self.space()
+                if len(members) > ZIP_FILES_AT_MOST:
+                    raise Refused(f"{name} holds more than {ZIP_FILES_AT_MOST} files.")
+                if (
+                    room["used"] + total > room["limit"]
+                    or room["free"] - total < KEEP_FREE_GB << 30
+                ):
+                    raise Refused(f"{name} unpacks to {total >> 20} MB: there isn't room.")
+                tops = {m.filename.split("/")[0] for m in members}
+                top = (
+                    f"{tops.pop()}/"
+                    if len(tops) == 1 and all("/" in m.filename for m in members)
+                    else ""
+                )
+                for member in members:
+                    inner = prefix + zip_name(member).removeprefix(zip_name_of(top))
+                    what = self._unpack_one(archive, member, inner, replace, counts, depth)
+                    counts[what] = counts.get(what, 0) + 1
+        except zipfile.BadZipFile as error:
+            raise Refused(f"{name} can't be opened as a zip ({error}).") from error
+        finally:
+            path.unlink(missing_ok=True)
+
+    def _unpack_one(self, archive, member, inner: str, replace, counts, depth: int) -> str:
+        suffix = Path(inner).suffix.lower()
+        cap = (WHOLE_FILE_MB if suffix in MARKDOWN else self.limits.max_mb) * 1024 * 1024
+        if ".." in member.filename.replace("\\", "/").split("/"):
+            return "skipped (a path outside the zip)"
+        if member.flag_bits & 1:
+            return "skipped (password-protected)"
+        if member.file_size > cap:
+            return "skipped (too large)"
+        if suffix == ".zip" and depth:
+            return "skipped (a zip inside a zip inside a zip)"
+        handle, temp = tempfile.mkstemp(dir=self.incoming, suffix=".part")
+        try:
+            with os.fdopen(handle, "wb") as out, archive.open(member) as data:
+                written = 0
+                while (block := data.read(1 << 20)) and written <= member.file_size:
+                    written += len(block)
+                    out.write(block)
+        except (zipfile.BadZipFile, OSError):
+            Path(temp).unlink(missing_ok=True)
+            return "skipped (damaged in the zip)"
+        if written > member.file_size:  # it lied about its size: a zip bomb
+            Path(temp).unlink()
+            return "skipped (larger than the zip said)"
+        if suffix == ".zip":
+            try:
+                self._unpack_into(inner, Path(temp), replace, counts, inner[:-4] + "/", depth + 1)
+            except Refused:
+                return "skipped (a zip inside that can't be opened)"
+            return "zip(s) inside unpacked"
+        what = self.add_file(inner, Path(temp), replace, notify=False)[1]
+        return "not added (a file of that name exists)" if what == "exists" else what
+
+    def clear(self) -> int:
+        """Start afresh: every file and every recorded answer goes."""
+        docs = self.documents()
+        for doc in docs:
+            self.delete(doc.id)
+        self._sql("DELETE FROM answers")
+        return len(docs)
+
+    def _changed(self) -> None:
+        """Files were added or removed: tell the listeners on the event loop (the upload
+        page calls from its own thread)."""
+        if self._loop and not self._loop.is_closed():
+            for listener in list(self.on_change):
+                self._loop.call_soon_threadsafe(listener)
 
     def delete(self, doc_id: str) -> bool:
         doc = self.get(doc_id)
@@ -372,6 +519,10 @@ class Library:
             self._sql(f"DELETE FROM {table} WHERE doc_id = ?", (doc_id,))
         self._sql("DELETE FROM documents WHERE id = ?", (doc_id,))
         Path(doc.path).unlink(missing_ok=True)
+        if doc.converted:
+            doc.converted.unlink(missing_ok=True)
+        shutil.rmtree(doc.media, ignore_errors=True)
+        self._changed()
         logger.info(f"Library: {doc.name} deleted")
         return True
 
@@ -398,9 +549,15 @@ class Library:
                 stale.unlink(missing_ok=True)
 
     async def stop(self) -> None:
-        if self._worker:
-            self._worker.cancel()
-            await asyncio.gather(self._worker, return_exceptions=True)
+        running = [t for t in (self._worker, *self._embedding) if t]
+        for task in running:
+            task.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
+
+    async def embedded(self) -> None:
+        """Wait for the meaning index to catch up with what has been read."""
+        while self._embedding:
+            await asyncio.gather(*self._embedding, return_exceptions=True)
 
     def _enqueue(self, doc_id: str) -> None:
         if not self._loop or doc_id in self._queued:
@@ -425,12 +582,21 @@ class Library:
             started = time.monotonic()
             try:
                 finished = await self._process(doc)
+            except Unreadable as error:
+                self._set(doc.id, status="failed", note=str(error))
+                continue
             except Exception as error:
+                if not self.get(doc.id):  # deleted while it was read
+                    self._clear(doc.id)
+                    continue
                 logger.exception(f"Library: couldn't read {doc.name}")
                 self._set(doc.id, status="failed", note=f"Couldn't read it: {error}")
                 continue
-            if not self.get(doc.id) or not finished:
-                continue  # deleted while being read, or waiting for a yes or for tomorrow
+            if not self.get(doc.id):  # deleted while it was read: no leftovers
+                self._clear(doc.id)
+                continue
+            if not finished:
+                continue  # waiting for a yes, or for tomorrow's scans
             self._set(doc.id, status="ready")
             logger.info(f"Library: {doc.name} ready in {time.monotonic() - started:.0f} s")
             for listener in list(self.on_ready):
@@ -453,6 +619,11 @@ class Library:
     async def _process(self, doc: Document) -> bool:
         """Read a document. False if it stopped to wait (a yes, or tomorrow's scans)."""
         path, suffix = Path(doc.path), doc.suffix
+        if suffix in CONVERT:
+            await asyncio.to_thread(convert, path, doc.converted, self.root)
+            path, suffix = doc.converted, doc.converted.suffix
+        elif suffix not in PDF | IMAGES | MARKDOWN | ROWS | TEXT:
+            await asyncio.to_thread(must_be_text, path, suffix)
         if suffix in PDF:
             return await self._read_pdf(doc, path)
         self._clear(doc.id)
@@ -462,10 +633,22 @@ class Library:
                 self._set(doc.id, status="paused", note=paused_note())
                 return False
             self._count_scans(1)
-            parts = [Part("page 1", (await self._see([path]))[0], scanned=True)]
+            with tempfile.TemporaryDirectory() as folder:
+                png = Path(folder) / "page-1.png"
+                if not await asyncio.to_thread(save_png, path.read_bytes(), png):
+                    raise Unreadable("Alfred can't open this image.")
+                parts = [Part("page 1", (await self._see([png]))[0], scanned=True)]
         elif suffix in MARKDOWN:
             markdown = await asyncio.to_thread(to_markdown, path)
-            parts = sections(markdown, suffix)
+            text = sections(markdown, suffix) + (word_charts(path) if suffix == ".docx" else [])
+            self._set(doc.id, total=len(text))
+            await self._store(doc, 0, text)  # searchable now; the pictures follow
+            parts = await self._pictures(doc, path, suffix, first=len(text))
+            if parts:
+                self._set(doc.id, total=len(text) + len(parts))
+                await self._store(doc, len(text), parts)
+            self._set(doc.id, done=len(text) + len(parts))
+            parts = []
         else:  # spreadsheets and text: read a batch at a time, whatever the size
             batches = row_batches(path) if suffix in ROWS else line_batches(path)
             done = 0
@@ -481,6 +664,23 @@ class Library:
         if suffix in SPREADSHEETS:
             self._set(doc.id, note="Figures are worked out from the file itself.")
         return True
+
+    async def _pictures(self, doc: Document, path: Path, suffix: str, first: int) -> list[Part]:
+        """Charts, diagrams and photos in a Word or PowerPoint file, read by vision (within
+        the daily scan limit), each saved as <its part's number>.png for the agent to see."""
+        found = pictures_in(path, suffix) if self._vision and suffix in (".docx", ".pptx") else []
+        if len(found) > (left := max(self.scans_left(), 0)):
+            self._set(doc.id, note=f"{len(found) - left} picture(s) not read: today's scan limit")
+        kept: list[tuple[str, Path]] = []
+        for at, picture in found[:left]:
+            png = doc.media / f"{first + len(kept)}.png"
+            if await asyncio.to_thread(save_png, picture, png):  # not a drawing Pillow can't open
+                kept.append((at, png))
+        if not kept:
+            return []
+        self._count_scans(len(kept))
+        texts = await self._see([png for _, png in kept])
+        return [Part(at, text, scanned=True) for (at, _), text in zip(kept, texts, strict=True)]
 
     def _clear(self, doc_id: str) -> None:
         if self.vectors:
@@ -520,11 +720,18 @@ class Library:
                 images = [image for _, image in pages if image]
                 self._count_scans(len(images))
                 seen = iter(await self._see(images)) if images else iter(())
-                parts = [
-                    Part(f"page {start + i + 1}", next(seen) if image else text, bool(image))
-                    for i, (text, image) in enumerate(pages)
-                ]
+                parts, pictures = [], []
+                for i, (text, image) in enumerate(pages):
+                    at = f"page {start + i + 1}"
+                    parts.append(Part(at, text) if text else Part(at, next(seen), True))
+                    if text and image:  # a chart or figure on a page of text
+                        pictures.append(Part(f"{at}, picture", next(seen), True))
                 await self._store(doc, start, parts)
+                if pictures:  # kept after the pages, so pages stay numbered in order
+                    before = self._sql(
+                        "SELECT count(*) FROM parts WHERE doc_id = ? AND ord >= ?", (doc.id, total)
+                    )[0][0]
+                    await self._store(doc, total + before, pictures)
                 self._set(doc.id, done=start + len(pages))
                 if out_of_scans:
                     self._set(doc.id, status="paused", note=paused_note())
@@ -564,10 +771,12 @@ class Library:
         return [text for texts in await asyncio.gather(*map(batch, groups)) for text in texts]
 
     async def _store(self, doc: Document, first: int, parts: list[Part]) -> None:
-        """Keep the parts and their chunks (searchable by keyword at once), then embed the
-        chunks for meaning search."""
+        """Keep the parts and their chunks (searchable by keyword at once), and embed the
+        chunks for meaning search in the background. Nothing for a file deleted meanwhile."""
         new: list[tuple[int, str]] = []
         with self._lock:
+            if not self._conn.execute("SELECT 1 FROM documents WHERE id = ?", (doc.id,)).fetchone():
+                return
             for ord_, part in enumerate(parts, start=first):
                 self._conn.execute(
                     "INSERT OR REPLACE INTO parts (doc_id, ord, location, text, scanned) "
@@ -582,7 +791,14 @@ class Library:
                     )
                     new.append((cursor.lastrowid, f"{label}\n{chunk}"))
             self._conn.commit()
-        await self._embed(new)
+        if new and self.vectors:
+            task = asyncio.create_task(self._embed_slowly(new))
+            self._embedding.add(task)
+            task.add_done_callback(self._embedding.discard)
+
+    async def _embed_slowly(self, rows: list[tuple[int, str]]) -> None:
+        async with self._embed_slots:
+            await self._embed(rows)
 
     async def _embed(self, rows: list[tuple[int, str]]) -> bool:
         """Embed (rowid, text) chunks into the meaning index. False if it couldn't (they're
@@ -684,7 +900,7 @@ class Library:
         if not chosen:
             names = ", ".join(p["location"] for p in parts[:40])
             return {"error": f"no {location!r} in {doc.name}. Its locations: {names}"}
-        text, shown = "", []
+        text, shown, pictures = "", [], []
         for part in chosen:
             piece = (
                 f"[{part['location']}]{' (scanned)' if part['scanned'] else ''}\n{part['text']}\n\n"
@@ -693,9 +909,12 @@ class Library:
                 break
             text += piece[:READ_AT_MOST]
             shown.append(part["location"])
+            if (picture := doc.media / f"{part['ord']}.png").exists():
+                pictures.append(str(picture))
         more = chosen[len(shown) :]
         return (
-            {"document": doc.name, "text": text}
+            {"document": doc.name, "text": text, "file": doc.readable}
+            | ({"pictures": pictures} if pictures else {})
             | ({"more": f"continues at {more[0]['location']}"} if more else {})
             | (
                 {"still_processing": f"{doc.done} of {doc.total} done"}
@@ -708,7 +927,7 @@ class Library:
         """For each citation (document, location, quote): None if the quote is at that
         location (or the next or previous one, for a quote across a page break), else why
         not."""
-        results = []
+        results, texts = [], {}  # each document's text loaded once
         for citation in citations:
             doc = self.find(str(citation.get("document", "")))
             quote = normal(str(citation.get("quote", "")))
@@ -718,7 +937,9 @@ class Library:
             if len(quote) < 8:
                 results.append("the quote is too short to check: quote a full phrase")
                 continue
-            parts = self._parts(doc.id)
+            if doc.id not in texts:
+                texts[doc.id] = self._parts(doc.id)
+            parts = texts[doc.id]
             here = pick(parts, str(citation.get("location", "")))
             if not here:
                 results.append(f"{doc.name} has no {citation.get('location')!r}")
@@ -790,7 +1011,9 @@ def within_budget(pages: list, scans_left: int) -> tuple[list, bool]:
     kept, scans = [], 0
     for text, image in pages:
         if image and scans == scans_left:
-            return kept, True
+            if not text:
+                return kept, True
+            image = None  # its text now; the picture on it isn't read (today's limit)
         scans += bool(image)
         kept.append((text, image))
     return kept, False
@@ -848,17 +1071,28 @@ def row_batches(path: Path, parts_at_once: int = 20):
 
 def row_parts(path: Path):
     if path.suffix.lower() == ".csv":
-        with path.open(newline="", encoding="utf-8", errors="replace") as file:
+        with path.open(newline="", encoding=text_encoding(path), errors="replace") as file:
             yield from table_parts("", csv.reader(file))
         return
     from openpyxl import load_workbook
 
+    # Saved results, and the formulas: a file made by a script has no saved results, so a
+    # total would read as blank; its formula is shown instead, to work out.
     book = load_workbook(path, read_only=True, data_only=True)
+    formulas = load_workbook(path, read_only=True)
     try:
-        for sheet in book.worksheets:
-            yield from table_parts(f"sheet {sheet.title}", sheet.iter_rows(values_only=True))
+        for sheet, written in zip(book.worksheets, formulas.worksheets, strict=True):
+            rows = zip_longest(
+                sheet.iter_rows(values_only=True), written.iter_rows(values_only=True)
+            )
+            merged = (
+                tuple(v if v is not None else f for v, f in zip_longest(a or (), b or ()))
+                for a, b in rows
+            )
+            yield from table_parts(f"sheet {sheet.title}", merged)
     finally:
         book.close()
+        formulas.close()
 
 
 def table_parts(sheet: str, rows):
@@ -892,7 +1126,7 @@ def table_part(sheet: str, header: str, body: list[str], first: int, last: int) 
 def line_batches(path: Path, parts_at_once: int = 20):
     """A text file, LINES_PER_PART lines a part, a few parts at a time."""
     batch: list[Part] = []
-    with path.open(encoding="utf-8", errors="replace") as file:
+    with path.open(encoding=text_encoding(path), errors="replace") as file:
         lines, first = [], 1
         for number, text in enumerate(file, start=1):
             lines.append(text.rstrip("\n"))
@@ -908,6 +1142,140 @@ def line_batches(path: Path, parts_at_once: int = 20):
         yield batch
 
 
+def text_encoding(path: Path) -> str:
+    """UTF-8 (a byte-order mark dropped), UTF-16, or else Windows' cp1252, as Excel on
+    Windows saves a CSV: so "Peñafrancia" stays "Peñafrancia"."""
+    with path.open("rb") as file:
+        start = file.read(1 << 24)
+    if start[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return "utf-16"
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(start, final=len(start) < 1 << 24)
+    except UnicodeDecodeError:
+        return "cp1252"
+    return "utf-8-sig"
+
+
+def must_be_text(path: Path, suffix: str) -> None:
+    """A file of a kind not known here is read as text, unless it's binary."""
+    with path.open("rb") as file:
+        if b"\0" in file.read(8192):
+            raise Unreadable(f"Alfred can't read {suffix or 'these'} files.")
+
+
+def libreoffice() -> str | None:
+    mac = "/Applications/LibreOffice.app/Contents/MacOS/soffice"
+    return shutil.which("soffice") or (mac if Path(mac).exists() else None)
+
+
+def convert(path: Path, copy: Path, root: Path) -> None:
+    """An old Office file as its modern kind (`copy`'s suffix), by LibreOffice."""
+    if not (office := libreoffice()):
+        install = "brew install --cask libreoffice" if sys.platform == "darwin" else "./setup.sh"
+        raise Unreadable(f"To read {path.suffix} files, install LibreOffice: {install}")
+    profile = f"-env:UserInstallation={(root / 'office').resolve().as_uri()}"  # its own
+    with tempfile.TemporaryDirectory() as folder:
+        try:
+            subprocess.run(
+                [office, "--headless", profile, "--convert-to", copy.suffix[1:], "--outdir",
+                 folder, path],
+                capture_output=True, timeout=120,
+            )  # fmt: skip
+        except subprocess.TimeoutExpired as error:
+            raise Unreadable("LibreOffice took too long to convert it.") from error
+        made = Path(folder) / f"{path.stem}{copy.suffix}"
+        if not made.exists():
+            raise Unreadable("LibreOffice couldn't convert it.")
+        shutil.move(made, copy)
+
+
+def pictures_in(path: Path, suffix: str) -> list[tuple[str, bytes]]:
+    """The pictures in a PowerPoint file, slide by slide ("slide 4, picture 2"), or in a
+    Word file ("picture 3"; small ones there are icons and bullets, left out)."""
+    if suffix == ".pptx":
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+        def walk(shapes):  # into groups; placeholders holding a picture have an image too
+            for shape in shapes:
+                if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    yield from walk(shape.shapes)
+                elif image := getattr(shape, "image", None):
+                    yield image.blob
+
+        slides = enumerate(Presentation(path).slides, start=1)
+        found = unique_blobs((n, blob) for n, slide in slides for blob in walk(slide.shapes))
+        return [(f"slide {n}, picture {i}", blob) for i, (n, blob) in enumerate(found, start=1)]
+    with zipfile.ZipFile(path) as word:
+        media = [i for i in word.infolist() if i.filename.startswith("word/media/")]
+        blobs = [word.read(i) for i in media if i.file_size >= PICTURE_BYTES_AT_LEAST]
+    return [(f"picture {i}", blob) for i, blob in enumerate(blobs, start=1)]
+
+
+def unique_blobs(items):
+    """Each image once, where it first appears (a logo or a chart repeated on slides)."""
+    seen: set[str] = set()
+    for at, blob in items:
+        if (digest := hashlib.sha256(blob).hexdigest()) not in seen:
+            seen.add(digest)
+            yield at, blob
+
+
+def word_charts(path: Path) -> list[Part]:
+    """A Word file's charts, as the data Word keeps inside each one (Word's reader skips
+    charts): "chart 1, sheet Sheet1, rows 2-5"."""
+    found = []
+    with zipfile.ZipFile(path) as word, tempfile.TemporaryDirectory() as folder:
+        books = sorted(n for n in word.namelist() if re.match(r"word/embeddings/.+\.xlsx$", n))
+        for number, name in enumerate(books, start=1):
+            book = Path(folder) / f"{number}.xlsx"
+            book.write_bytes(word.read(name))
+            found += [Part(f"chart {number}, {p.location}", p.text) for p in row_parts(book)]
+    return found
+
+
+def save_png(picture: bytes, png: Path) -> bool:
+    """A picture as a PNG Claude can read, at most 2,000 pixels a side. False for one
+    Pillow can't open (an EMF drawing)."""
+    from io import BytesIO
+
+    from PIL import Image, UnidentifiedImageError
+
+    try:
+        with Image.open(BytesIO(picture)) as image:
+            png.parent.mkdir(parents=True, exist_ok=True)
+            image = image.convert("RGB")
+            image.thumbnail((2000, 2000))
+            image.save(png)
+    except (UnidentifiedImageError, OSError):
+        return False
+    return True
+
+
+def zip_name(member: zipfile.ZipInfo) -> str:
+    """A zip member's name. One not marked UTF-8 is read as UTF-8 if it is (a Mac writes
+    them so), else as the old DOS encoding the format says."""
+    return zip_name_of(member.filename, member.flag_bits & 0x800)
+
+
+def zip_name_of(name: str, utf8: bool = False) -> str:
+    if utf8:
+        return name
+    try:
+        return name.encode("cp437").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return name
+
+
+def junk(name: str) -> bool:
+    """What zips carry along: Mac and Windows clutter, hidden and lock files."""
+    parts = name.lower().replace("\\", "/").split("/")
+    return any(
+        p in ("__macosx", "thumbs.db", "desktop.ini") or (p.startswith((".", "~$")) and p != "..")
+        for p in parts
+    )
+
+
 def page_count(path: Path) -> int:
     import pypdfium2 as pdfium
 
@@ -920,7 +1288,8 @@ def page_count(path: Path) -> int:
 
 def pdf_pages(path: Path, start: int, count: int, folder: Path) -> list[tuple[str, Path | None]]:
     """(text, None) for each page with text; ("", image) for a page that needs reading
-    as an image (a scan)."""
+    as an image (a scan); (text, image) for a page of text with a large picture on it, a
+    quarter of the page or more (a chart, not a logo)."""
     import pypdfium2 as pdfium
 
     pdf = pdfium.PdfDocument(path)
@@ -931,12 +1300,19 @@ def pdf_pages(path: Path, start: int, count: int, folder: Path) -> list[tuple[st
             textpage = page.get_textpage()
             text = textpage.get_text_bounded().replace("\r\n", "\n").strip()
             textpage.close()
-            if len(text) >= SCANNED_BELOW:
-                pages.append((text, None))
-            else:
-                image = folder / f"page-{i + 1}.png"
+            width, height = page.get_size()
+            pictured = any(
+                (right - left) * (top - bottom) >= width * height / 4
+                for left, bottom, right, top in (
+                    o.get_bounds()
+                    for o in page.get_objects(filter=[3])  # 3: images
+                )
+            )
+            text = text if len(text) >= SCANNED_BELOW else ""
+            image = folder / f"page-{i + 1}.png" if pictured or not text else None
+            if image:
                 page.render(scale=200 / 72).to_pil().save(image)
-                pages.append(("", image))
+            pages.append((text, image))
             page.close()
     finally:
         pdf.close()
@@ -1063,7 +1439,13 @@ def answer_page(answer: str, citations: list[dict], library: Library) -> str:
     from html import escape
 
     items = []
-    for c in citations:
+    for c in sorted(citations, key=lambda c: bool(c.get("url"))):  # the user's files first
+        if url := c.get("url"):
+            items.append(
+                f"<li><blockquote>{escape(str(c.get('quote', '')))}</blockquote><a "
+                f"href='{escape(url)}'>{escape(short(url, 80))}</a> (from the web)</li>"
+            )
+            continue
         doc = library.find(str(c.get("document", "")))
         location = str(c.get("location", ""))
         page = re.search(r"\d+", location) if doc and doc.suffix in PDF else None
@@ -1105,9 +1487,10 @@ def claude_vision(model: str) -> Vision:
     instructions = (
         "You transcribe document page images exactly. For each image, in the order given, "
         "write a line '=== <file name> ===' and then the page's text word for word: no "
-        "corrections, no summaries, no commentary. Keep tables as Markdown tables. Describe "
-        "figures and charts briefly in [brackets]. Write [unclear] for anything you cannot "
-        "read. Read every image with the Read tool first."
+        "corrections, no summaries, no commentary. Keep tables as Markdown tables. Describe a "
+        "chart, diagram or photo fully in [brackets]: its title, every label, value, axis "
+        "and legend you can read. Write [unclear] for anything you cannot read. Read every "
+        "image with the Read tool first."
     )
 
     async def see(images: list[Path]) -> list[str]:

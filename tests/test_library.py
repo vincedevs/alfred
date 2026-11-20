@@ -79,6 +79,7 @@ async def ready(library: Library, name: str, data: bytes):
     for _ in range(400):
         doc = library.get(doc.id)
         if doc.status in ("ready", "failed"):
+            await library.embedded()  # meaning search catches up in the background
             return doc
         await asyncio.sleep(0.01)
     raise AssertionError(f"{name} never finished: {doc}")

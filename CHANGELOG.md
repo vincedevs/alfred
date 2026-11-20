@@ -2,7 +2,57 @@
 
 All notable changes are listed here. Versions follow [Semantic Versioning](https://semver.org/).
 
-## 1.1.0 (unreleased)
+## 1.2.0
+
+### Added
+- **Zips are unpacked** into their files, named by their path inside (Mac names too); zip
+  bombs, paths that climb out, damaged entries and clutter are refused or skipped, each
+  with the reason. A dropped folder keeps its folder names the same way.
+- **Pictures are read:** charts, diagrams and photos in Word and PowerPoint files
+  (grouped ones too, each image once), large pictures on PDF pages, and Word's native
+  charts from the data inside them. Claude describes charts in full; the agent gets each
+  file and picture to look at itself. A file's text is searchable before its pictures are
+  read; pictures beyond the daily scan limit are noted on the file.
+- **Old Office files** (`.doc`, `.ppt`, `.rtf`, OpenDocument) are converted by LibreOffice
+  and cited by their own name.
+- **Web facts are checked:** a citation may be a web page (HTML or PDF), read with the new
+  `read_web_page`; the quote must be on it. A page on your own network is never fetched,
+  even by a redirect or a changed address. The answer page lists them "from the web".
+- **No unchecked answer from your files:** a task that read them is held back once to
+  call `cite_answer`, unless its answer states nothing from them.
+- **Quick answers from your files:** the delegate searches them itself (`search_files`)
+  and, when one passage answers, says it once `check_answer_from_files` accepts the quote:
+  seconds, not the agent's 10–20. Harder questions go to the agent.
+- **Clear the library** on the library page. Library actions now need a header only that
+  page sends, so another website can't clear, delete or upload.
+- **`./setup.sh`** installs everything Alfred needs, on the Pi or a Mac.
+
+### Changed
+- While you have files, every question of fact goes to them first; GPT-Live is told
+  quietly when files arrive mid-conversation.
+- Reading is silent: no "your file is ready"; a large scan waits for your yes on the page.
+- With files still being read, waiting for your yes, or waiting for tomorrow's scan limit,
+  Alfred says which, rather than "it isn't in your documents".
+- Memory is told not to keep what your files say (a prompt rule).
+- `answering-from-documents` now says where to look, and how to cite the web. Starter
+  skills are copied once, so update an existing install's copy by hand:
+  `cp skills/answering-from-documents/SKILL.md ~/.alfred/skills/skills/answering-from-documents/`
+
+### Fixed
+- Text saved by Excel on Windows reads right ("Peñafrancia", not "Pe�afrancia"), so quotes
+  from it are accepted; UTF-16 text and a CSV's byte-order mark too.
+- A spreadsheet total that is a formula with no saved result showed blank; its formula is
+  shown, to work out.
+- Files Alfred can't read were "ready" as unreadable characters; they fail with the reason.
+- A file deleted while it was read stayed searchable; nothing of it is left now.
+- A name that fits several files (`q3.csv` in two folders) no longer picks one at random.
+- Large zips: each file is added without reading the whole library again; zips may be as
+  large as the library has room for.
+- Reading no longer waits for meaning search: embeddings catch up in the background.
+- BMP and TIFF images, and large photos, are made PNGs of at most 2,000 pixels for Claude.
+- `setup.sh` installs LibreOffice without its optional extras.
+
+## 1.1.0
 
 ### Added
 - **The library: answers from your own files, with checked citations.** Upload files on

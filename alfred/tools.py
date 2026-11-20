@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 from pipecat.services.llm_service import FunctionCallParams
 
-from alfred.agent import Agent
+from alfred.agent import Agent, check_answer
 from alfred.apps import Apps
 from alfred.db import Database, Task
 from alfred.library import Library
@@ -179,8 +179,36 @@ def delegate_tools(
     async def list_documents(params: FunctionCallParams):
         """The files in the user's library (uploaded on the apps page), and whether each is
         ready. Questions about what they say go to do_task."""
-        docs = [d.describe() for d in library.documents()] if library else []
+        docs = [d.describe(with_file=False) for d in library.documents()] if library else []
         await params.result_callback({"documents": docs})
+
+    async def search_files(params: FunctionCallParams, query: str):
+        """Search the user's files, fast: the best passages for a question of fact, each
+        with its document and location.
+
+        Args:
+            query: The question's key words.
+        """
+        found = (await library.search(query))[:5] if library else []
+        waiting = library.waiting_text() if library else ""
+        await params.result_callback(
+            {"passages": found} | ({"not yet read": waiting} if waiting else {})
+        )
+
+    async def check_answer_from_files(
+        params: FunctionCallParams, answer: str, citations: list[dict]
+    ):
+        """Check an answer from the user's files before saying it: for every claim, the
+        document, location and an exact quote, as search_files gave them. Say the answer
+        only once it is accepted.
+
+        Args:
+            answer: The answer, as you'll say it.
+            citations: For every claim: {"document": ..., "location": ..., "quote": ...}.
+        """
+        pages = agent.projects.path("general") / ".alfred" / "pages"
+        args = {"answer": answer, "citations": citations}
+        await params.result_callback(await check_answer(library, "general", pages, args, {}))
 
     async def read_large_scan(params: FunctionCallParams, document: str):
         """The user said yes to reading a file with many scanned pages (it uses their Claude
@@ -215,7 +243,8 @@ def delegate_tools(
     return [
         do_task, task_status, answer_task, stop_task,
         remember, recall, forget, remind, list_reminders, cancel_reminder,
-        list_apps, stop_app, restart_app, list_documents, read_large_scan,
+        list_apps, stop_app, restart_app, list_documents, search_files, check_answer_from_files,
+        read_large_scan,
         list_skills, forget_skill, sleep,
     ]  # fmt: skip
 

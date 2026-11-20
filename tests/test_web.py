@@ -80,8 +80,9 @@ def test_the_library_page_takes_uploads_in_pieces(tmp_path):
         web = start_web(projects, Apps(projects, str), 0, library)
         base = f"http://127.0.0.1:{web.port}"
 
-        def post(path, data=b""):
-            request = urllib.request.Request(base + path, data=data, method="POST")
+        def post(path, data=b"", header=True):
+            headers = {"X-Alfred": "1"} if header else {}  # as the library page sends
+            request = urllib.request.Request(base + path, data=data, method="POST", headers=headers)
             try:
                 with urllib.request.urlopen(request, timeout=5) as reply:
                     return reply.status, json.loads(reply.read())
@@ -116,6 +117,8 @@ def test_the_library_page_takes_uploads_in_pieces(tmp_path):
             too_big = await asyncio.to_thread(piece, 0, b"x", 2 << 20, "big.txt")
             assert too_big[0] == 413 and "limit is 1 MB" in too_big[1]["error"]
             assert (await asyncio.to_thread(post, "/library/approve?id=nothing"))[0] == 404
+            other_site = await asyncio.to_thread(post, "/library/clear", b"", False)
+            assert other_site[0] == 403 and library.documents()  # another site can't clear it
             assert (await asyncio.to_thread(post, f"/library/delete?id={doc.id}"))[0] == 200
             assert library.documents() == []
             for asset in ("/static/alfred.css", "/static/library.js"):

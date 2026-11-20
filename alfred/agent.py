@@ -35,6 +35,7 @@ from claude_agent_sdk import (
 )
 from loguru import logger
 
+from alfred import webcheck
 from alfred.apps import Apps
 from alfred.audit import AuditLog
 from alfred.config import PROJECT_ROOT, Config, load_prompt
@@ -218,6 +219,7 @@ class Agent:
         guard = HookMatcher(
             hooks=[self._guard.hook_for(task_id, folder)], timeout=QUESTION_TIMEOUT + 60
         )
+        answer = {"read_files": False, "checked": False, "held": 0}  # for the Stop hook
         prompt = (
             load_prompt("agent")
             + config.context_text()
@@ -244,9 +246,10 @@ class Agent:
                     self._apps,
                     self.library,
                     folder / ".alfred" / "pages",
+                    answer,
                 )
             },
-            hooks={"PreToolUse": [guard]},
+            hooks={"PreToolUse": [guard], "Stop": [HookMatcher(hooks=[checked_answers(answer)])]},
             can_use_tool=refuse_unchecked,
             sandbox={
                 "enabled": True,
@@ -270,6 +273,7 @@ def alfred_server(
     apps: Apps | None = None,
     library: Library | None = None,
     pages: Path | None = None,
+    answer: dict | None = None,
 ):
     """The tools Alfred adds: asking you a question out loud, saving a lesson, starting
     the project's app so the user can try it, and the library's search, reading and
@@ -314,18 +318,49 @@ def alfred_server(
         return {"content": [{"type": "text", "text": json.dumps(result)}]}
 
     return create_sdk_mcp_server(
-        "alfred", tools=[ask_user, save_lesson, serve_app, *library_tools(library, project, pages)]
+        "alfred",
+        tools=[ask_user, save_lesson, serve_app, *library_tools(library, project, pages, answer)],
     )
 
 
-def library_tools(library: Library | None, project: str, pages: Path | None) -> list:
-    """The library's tools: list, search, read, and the citation check."""
+def checked_answers(answer: dict):
+    """The Stop hook: a task that read the user's files is held back once if cite_answer
+    hasn't accepted its answer (or heard it isn't in them)."""
+
+    async def before_stopping(_input, _tool_use_id, _context) -> dict:
+        if not answer["read_files"] or answer["checked"] or answer["held"]:
+            return {}
+        answer["held"] += 1
+        return {"decision": "block", "reason": UNCHECKED}
+
+    return before_stopping
+
+
+UNCHECKED = (
+    "You read the user's files but gave no checked answer. If your answer states anything "
+    "from them, call cite_answer with a citation for every claim (or found: false if they "
+    "don't have it) and answer as it says; if it states nothing from them, just finish."
+)
+
+
+def library_tools(
+    library: Library | None, project: str, pages: Path | None, answer: dict | None = None
+) -> list:
+    """The library's tools: list, search, read, and the citation check. `answer` records,
+    for the Stop hook, whether the files were read and the answer checked."""
+    answer = answer if answer is not None else {"read_files": False, "checked": False}
+    fetched: dict = {}  # the web pages read for this task, so each is fetched once
 
     def reply(value) -> dict:
         text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
         return {"content": [{"type": "text", "text": text}]}
 
-    @tool("list_documents", "The files in the user's library, and whether each is ready.", {})
+    @tool(
+        "list_documents",
+        "The files in the user's library, whether each is ready, and its file (to calculate "
+        "from, or to look at a page or picture with Read).",
+        {},
+    )
     async def list_documents(_args: dict) -> dict:
         return reply([d.describe() for d in library.documents()] if library else [])
 
@@ -339,6 +374,7 @@ def library_tools(library: Library | None, project: str, pages: Path | None) -> 
     async def search_documents(args: dict) -> dict:
         if not library:
             return reply("There is no library here.")
+        answer["read_files"] = True
         found = await library.search(args["query"], args.get("document") or "")
         return reply(found or "Nothing found: try other words, synonyms or a shorter query.")
 
@@ -352,17 +388,20 @@ def library_tools(library: Library | None, project: str, pages: Path | None) -> 
     async def read_document(args: dict) -> dict:
         if not library:
             return reply("There is no library here.")
+        answer["read_files"] = True
         return reply(library.read(args["document"], args["location"]))
 
     @tool(
         "cite_answer",
-        "Check an answer from the user's documents before you give it: every claim's "
-        "citation (document, location, an exact quote from that location). Fix or drop "
-        "any citation it rejects, and call it again; give the answer only once all pass.",
+        "Check an answer before you give it: every claim's citation, from the user's files "
+        "(document, location, an exact quote there) or, for what they don't have, the web "
+        "(url and an exact quote from that page). Fix or drop any citation it rejects and "
+        "call it again; answer only once all pass. found: false when the files don't have it.",
         {
             "type": "object",
             "properties": {
                 "answer": {"type": "string"},
+                "found": {"type": "boolean"},
                 "citations": {
                     "type": "array",
                     "items": {
@@ -370,37 +409,74 @@ def library_tools(library: Library | None, project: str, pages: Path | None) -> 
                         "properties": {
                             "document": {"type": "string"},
                             "location": {"type": "string"},
+                            "url": {"type": "string"},
                             "quote": {"type": "string"},
                         },
-                        "required": ["document", "location", "quote"],
+                        "required": ["quote"],
                     },
                 },
             },
-            "required": ["answer", "citations"],
+            "required": ["answer"],
         },
     )
     async def cite_answer(args: dict) -> dict:
         if not library:
             return reply("There is no library here.")
-        citations = list(args.get("citations") or [])
-        problems = library.check(citations)
-        failed = [{"citation": i + 1, "problem": p} for i, p in enumerate(problems) if p]
-        if failed or not citations:
-            why = failed or "an answer from the documents needs at least one citation"
-            return reply({"checked": False, "fix": why})
-        library.record(project, args["answer"], citations)
-        result = {"checked": True}
-        if pages:
-            pages.mkdir(parents=True, exist_ok=True)
-            page = pages / f"answer-{time.strftime('%Y%m%d-%H%M%S')}.html"
-            page.write_text(answer_page(args["answer"], citations, library), encoding="utf-8")
-            result["page"] = f"pages/{project}/{page.name} on the apps page"
-        scanned = [c for c in citations if library.scanned_at(c["document"], c["location"])]
-        if scanned:
-            result["say"] = "Some sources are scanned pages: say 'from the scanned copy'."
+        result = await check_answer(library, project, pages, args, fetched)
+        answer["checked"] = bool(result.get("checked") or result.get("noted"))
         return reply(result)
 
-    return [list_documents, search_documents, read_document, cite_answer]
+    @tool(
+        "read_web_page",
+        "The text of a web page, the same text cite_answer checks web quotes against: quote "
+        "from this, not from WebFetch (which summarizes).",
+        {"url": str},
+    )
+    async def read_web_page(args: dict) -> dict:
+        text = await webcheck.page(args["url"], fetched)
+        return reply(f"Couldn't open it: {text}" if isinstance(text, Exception) else text[:24000])
+
+    return [list_documents, search_documents, read_document, cite_answer, read_web_page]
+
+
+async def check_answer(library: Library, project: str, pages: Path | None, args: dict, fetched):
+    """Every citation checked: a file's quote at its location, a web quote on its page (the
+    pages fetched together). Accepted: recorded, and the answer page written."""
+    citations = list(args.get("citations") or [])
+    if args.get("found") is False and not citations:
+        waiting = library.waiting_text()
+        say = (
+            f"Not found so far, but {waiting}: say so, and that it may be in them."
+            if waiting
+            else "Say it isn't in their files, and what you searched for."
+        )
+        return {"noted": True, "say": say}
+    urls = {c["url"] for c in citations if c.get("url")}
+    await asyncio.gather(*(webcheck.page(url, fetched) for url in urls))
+    files = [c for c in citations if not c.get("url")]
+    checked = dict(zip(map(id, files), library.check(files), strict=True))
+    problems = [
+        await webcheck.quote_on_page(c["url"], c.get("quote", ""), fetched)
+        if c.get("url")
+        else checked[id(c)]
+        for c in citations
+    ]
+    failed = [{"citation": i + 1, "problem": p} for i, p in enumerate(problems) if p]
+    if failed or not citations:
+        return {"checked": False, "fix": failed or "an answer needs citations, or found: false"}
+    library.record(project, args["answer"], citations)
+    result: dict = {"checked": True}
+    if pages:
+        pages.mkdir(parents=True, exist_ok=True)
+        page = pages / f"answer-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 10**9:09d}.html"
+        page.write_text(answer_page(args["answer"], citations, library), encoding="utf-8")
+        result["page"] = f"pages/{project}/{page.name} on the apps page"
+    say = []
+    if urls:
+        say.append("Say which facts are from their files and which from the web.")
+    if any(library.scanned_at(c.get("document", ""), c.get("location", "")) for c in files):
+        say.append("Say 'from the scanned copy' where it is.")
+    return result | ({"say": " ".join(say)} if say else {})
 
 
 async def refuse_unchecked(tool_name: str, _input: dict, _context) -> PermissionResultDeny:

@@ -25,6 +25,10 @@ const size = (bytes) =>
       ? `${(bytes / 1048576).toFixed(1)} MB`
       : `${(bytes / 1073741824).toFixed(1)} GB`;
 const pause = (ms) => new Promise((done) => setTimeout(done, ms));
+// Library actions carry this header: another site's page can't send it, so can't use them.
+const post = (url, body) => fetch(url, { method: "POST", body, headers: { "X-Alfred": "1" } });
+// A file's name with the folders it came in ("reports/q3.pdf"), as a zip's files are named.
+const nameOf = (file) => file.alfredPath || file.webkitRelativePath || file.name;
 const newId = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()).replace(/[^a-z0-9-]/gi, "").toLowerCase();
 
 function bar() {
@@ -40,9 +44,9 @@ async function upload(file, replace) {
   const row = document.createElement("li");
   const meta = text("div", `Waiting to upload, ${size(file.size)}`, "meta");
   const progress = bar();
-  row.append(text("div", file.name, "name"), meta, progress);
+  row.append(text("div", nameOf(file), "name"), meta, progress);
   uploads.append(row);
-  if (file.size > LIMIT) {
+  if (file.size > LIMIT && !file.name.toLowerCase().endsWith(".zip")) {
     meta.textContent = `Too large: the limit is ${size(LIMIT)}.`;
     progress.remove();
     return;
@@ -52,10 +56,10 @@ async function upload(file, replace) {
   let tries = 0;
   while (true) {
     const piece = file.slice(have, Math.min(have + PIECE, file.size));
-    const params = new URLSearchParams({ id, name: file.name, size: file.size, offset: have, replace: replace ? "1" : "0" });
+    const params = new URLSearchParams({ id, name: nameOf(file), size: file.size, offset: have, replace: replace ? "1" : "0" });
     let reply;
     try {
-      const response = await fetch(`/library/upload?${params}`, { method: "POST", body: piece });
+      const response = await post(`/library/upload?${params}`, piece);
       reply = await response.json();
       if (!response.ok && response.status !== 409) {
         meta.textContent = reply.error || "The upload was refused.";
@@ -80,7 +84,7 @@ async function upload(file, replace) {
       const said = { added: "Added", replaced: "Replaced the old version", "already there": "Already in the library", exists: "Not uploaded: a file with this name exists" };
       meta.textContent = said[reply.done] || reply.done;
       progress.remove();
-      setTimeout(() => row.remove(), reply.done === "exists" ? 8000 : 2500);
+      setTimeout(() => row.remove(), reply.done in said && reply.done !== "exists" ? 2500 : 12000);
       refresh();
       return;
     }
@@ -90,16 +94,16 @@ async function upload(file, replace) {
 async function send(files) {
   const queue = [...files].filter((f) => f.size > 0 || f.name);
   const names = new Set(known.map((d) => d.document.toLowerCase()));
-  const clashes = queue.filter((f) => names.has(f.name.toLowerCase()));
+  const clashes = queue.filter((f) => names.has(nameOf(f).toLowerCase()));
   let replace = false;
   if (clashes.length) {
-    const shown = clashes.slice(0, 5).map((f) => f.name).join(", ") + (clashes.length > 5 ? ", ..." : "");
+    const shown = clashes.slice(0, 5).map(nameOf).join(", ") + (clashes.length > 5 ? ", ..." : "");
     replace = confirm(`Replace the library's ${shown} with the new version${clashes.length > 1 ? "s" : ""}? Identical files are skipped either way.`);
   }
   const workers = Array.from({ length: AT_ONCE }, async () => {
     while (queue.length) {
       const file = queue.shift();
-      const clash = names.has(file.name.toLowerCase());
+      const clash = names.has(nameOf(file).toLowerCase());
       if (clash && !replace) continue;
       await upload(file, clash && replace);
     }
@@ -109,7 +113,11 @@ async function send(files) {
 
 // A dropped folder: every file in it, however deep.
 async function filesIn(entry) {
-  if (entry.isFile) return [await new Promise((done, fail) => entry.file(done, fail))];
+  if (entry.isFile) {
+    const file = await new Promise((done, fail) => entry.file(done, fail));
+    file.alfredPath = entry.fullPath.replace(/^\//, "");
+    return [file];
+  }
   const reader = entry.createReader();
   const found = [];
   while (true) {
@@ -157,7 +165,7 @@ function render(docs) {
     if (doc.status === "asking") {
       const yes = text("button", "Read it", "primary");
       yes.onclick = async () => {
-        await fetch(`/library/approve?id=${doc.id}`, { method: "POST" });
+        await post(`/library/approve?id=${doc.id}`);
         refresh();
       };
       side.append(yes);
@@ -165,7 +173,7 @@ function render(docs) {
     const remove = text("button", "Delete", "danger");
     remove.onclick = async () => {
       if (!confirm(`Delete ${doc.document}? Alfred will no longer answer from it.`)) return;
-      await fetch(`/library/delete?id=${doc.id}`, { method: "POST" });
+      await post(`/library/delete?id=${doc.id}`);
       refresh();
     };
     side.append(remove);
@@ -187,6 +195,7 @@ async function refresh() {
     known = reply.documents;
     render(known);
     showSpace(reply.space, reply.keep_free);
+    document.getElementById("clear").hidden = !known.length;
     const busy = known.some((d) => ["waiting", "processing"].includes(d.status));
     timer = setTimeout(refresh, busy ? 1500 : 15000);
   } catch {
@@ -194,6 +203,11 @@ async function refresh() {
   }
 }
 
+document.getElementById("clear").onclick = async () => {
+  if (!confirm(`Delete all ${known.length} files? Alfred will no longer answer from them.`)) return;
+  await post("/library/clear");
+  refresh();
+};
 tray.onclick = () => picker.click();
 document.getElementById("pick-folder").onclick = () => folder.click();
 picker.onchange = () => send(picker.files).then(() => (picker.value = ""));

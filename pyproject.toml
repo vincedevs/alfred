@@ -1,6 +1,6 @@
 [project]
 name = "alfred"
-version = "1.1.0"
+version = "1.2.0"
 description = "Alfred: a general-purpose voice agent for the Raspberry Pi 5, built for coding"
 readme = "README.md"
 authors = [{ name = "Vince Duero", email = "vince.duero@gmail.com" }]

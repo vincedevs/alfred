@@ -65,12 +65,16 @@ class AppsPage(SimpleHTTPRequestHandler):
         body = self.rfile.read(size) if size else b""
         if not self.library:
             return self.send_error(404)
+        if self.headers.get("X-Alfred") != "1":  # only the library page sends it, not other sites
+            return self._send_json(403, {"error": "Use the library page."})
         if url.path == "/library/delete":
             deleted = self.library.delete(query.get("id", ""))
             return self._send_json(200 if deleted else 404, {"deleted": deleted})
         if url.path == "/library/approve":
             doc = self.library.approve(query.get("id", ""))
             return self._send_json(200 if doc else 404, {"reading": bool(doc)})
+        if url.path == "/library/clear":
+            return self._send_json(200, {"cleared": self.library.clear()})
         if url.path != "/library/upload":
             return self.send_error(404)
         try:
@@ -83,7 +87,7 @@ class AppsPage(SimpleHTTPRequestHandler):
         except (Refused, ValueError) as error:
             return self._send_json(413, {"error": str(error)})
         status = 409 if what == "exists" else 200
-        return self._send_json(status, {"have": have, "done": what, "document": doc.name})
+        return self._send_json(status, {"have": have, "done": what, "document": doc and doc.name})
 
     def _discard(self, size: int) -> None:
         while size > 0:  # read it away first, so the browser hears the answer
@@ -216,18 +220,20 @@ def library_page(library: Library) -> str:
         "against the file.</p>"
         f"<button class=tray id=tray type=button data-limit='{library.max_bytes}'>"
         "<img src='/static/alfred-logo.svg' alt=''>"
-        "<strong>Hand Alfred a file</strong><span>Drop files or a folder here, or click to "
-        "choose files.</span><span class=formats>PDF, Word, PowerPoint, Excel, CSV, EPUB, web "
-        f"pages, text and images. Up to {limit} MB each; {WHOLE_FILE_MB} MB for Word, "
+        "<strong>Hand Alfred a file</strong><span>Drop files, a folder or a zip here, or "
+        "click to choose files.</span><span class=formats>PDF, Word, PowerPoint, Excel, CSV, "
+        f"EPUB, web pages, text and images. Up to {limit} MB each; {WHOLE_FILE_MB} MB for Word, "
         "PowerPoint, EPUB and web pages.</span></button>"
         "<input id=picker type=file multiple hidden>"
         "<input id=folder type=file webkitdirectory hidden>"
         "<p class=hint><button class=link id=pick-folder type=button>Choose a folder</button>. "
-        "Scanned pages and photos are read by Claude, so they take longer; for a large scan "
-        "Alfred asks first.</p>"
+        "Scanned pages and photos are read by Claude, so they take longer; a large scan "
+        "waits for your yes here.</p>"
         "<p class=space id=space></p>"
         "<ul class='rows' id=uploads></ul>"
         "<h2>Files</h2><ul class='rows sheet' id=files><li class=empty>Loading…</li></ul>"
+        "<p class=hint><button class='link' id=clear type=button hidden>Clear the library"
+        "</button></p>"
     )
     return layout("Alfred's library", "/library", body, "library.js")
 
@@ -241,7 +247,7 @@ def library_json(library: Library) -> dict:
     for doc in docs:
         unit = ("page" if doc.suffix == ".pdf" else "part") + ("s" if doc.total != 1 else "")
         found.append(
-            doc.describe()
+            doc.describe(with_file=False)
             | {
                 "done": doc.done,
                 "total": doc.total,

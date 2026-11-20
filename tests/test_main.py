@@ -52,3 +52,14 @@ def test_an_alarm_stops_ringing_after_a_while(monkeypatch):
     engine = Speaker([])
     assert asyncio.run(alfred_main.ring(engine, Ears(), "beep")) is False
     assert len(engine.played) > 1 and engine.stopped  # rang again and again, then stopped
+
+
+def test_the_setup_script_parses_and_explains_itself():
+    import subprocess
+
+    from alfred.config import PROJECT_ROOT
+
+    script = str(PROJECT_ROOT / "setup.sh")
+    subprocess.run(["bash", "-n", script], check=True)
+    shown = subprocess.run([script, "--help"], capture_output=True, text=True, check=True)
+    assert "--no-office" in shown.stdout and "--service" in shown.stdout
