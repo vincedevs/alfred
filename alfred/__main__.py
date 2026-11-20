@@ -13,9 +13,11 @@ import gc
 import os
 import signal
 import sys
+from importlib.metadata import version
 
 from loguru import logger
 
+from alfred import display
 from alfred.agent import Agent
 from alfred.audio import AudioEngine, load_sound
 from alfred.config import PROJECT_ROOT, Config, ConfigError, load_config
@@ -38,12 +40,17 @@ async def run(config: Config) -> None:
     engine = AudioEngine(config.input_device, config.output_device, config.echo_cancellation)
     engine.start()
     services = Services.start(config)
+    show_library(services.library)
+    claude = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
+    checks = {"mic": True, "OpenAI": bool(config.openai_api_key), "Claude": bool(claude)}
+    display.card(version("alfred"), checks, services.web.ip_address if services.web else None)
     services.agent.on_finished.append(lambda _task: engine.play(done))
     handle_shutdown_signals(services.agent)
     background: set[asyncio.Task] = set()
     try:
         while True:
             logger.info('Waiting for "Hey Alfred"...')
+            display.status(mode='Say "Hey Alfred"')
             woken = await wait_for_wake_or_news(engine, detector, services)
             logger.info(
                 f"Wake word heard (score {detector.last_score:.2f})" if woken else "Speaking up"
@@ -55,6 +62,7 @@ async def run(config: Config) -> None:
                 if ringing:
                     woken = await ring(engine, detector, ringing)
             engine.play(wake if woken else done)
+            display.status(mode="Listening")
             transcript = await run_conversation(engine, services, woken)
             if asyncio.current_task().cancelling():  # Pipecat swallows Ctrl+C: pass it on
                 raise asyncio.CancelledError
@@ -78,6 +86,19 @@ async def run(config: Config) -> None:
         engine.close()
         gc.collect()  # Claude's subprocess objects, while the loop can still close them
         await asyncio.sleep(0.1)
+
+
+def show_library(library) -> None:
+    """The status bar's count of files, kept up to date."""
+
+    def count(*_) -> None:
+        docs = library.documents()
+        ready = sum(d.status == "ready" for d in docs)
+        display.status(files=f"{ready} of {len(docs)} files ready" if docs else "no files")
+
+    library.on_change.append(count)
+    library.on_ready.append(count)
+    count()
 
 
 async def wait_for_wake_or_news(
@@ -169,8 +190,10 @@ def main() -> None:
     _lock = only_one_alfred(config.data_dir)
     if _lock is None:
         sys.exit("Alfred is already running (stop the other one first).")
+    display.on = "--plain" not in sys.argv and display.console.is_terminal
     setup_logging(config)
     sys.unraisablehook = quiet_closed_loop_noise
+    display.start()
     try:
         asyncio.run(run(config))
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -178,6 +201,8 @@ def main() -> None:
     except Exception:
         logger.exception("Alfred crashed")
         sys.exit(1)
+    finally:
+        display.stop()
 
 
 if __name__ == "__main__":

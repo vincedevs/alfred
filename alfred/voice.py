@@ -8,6 +8,7 @@ calls Alfred's tools here (tools.py), above all do_task, which hands work to the
 """
 
 import asyncio
+import re
 import time
 
 from loguru import logger
@@ -34,6 +35,7 @@ from pipecat.services.openai.live.llm import OpenAILiveLLMService
 from pipecat.services.openai.responses.llm import OpenAIResponsesLLMService
 from pipecat.workers.runner import WorkerRunner
 
+from alfred import display
 from alfred.announcer import Announcer, opening_messages, recent_context
 from alfred.audio import SAMPLE_RATE, AudioEngine, load_sound
 from alfred.config import PROJECT_ROOT, Config, load_prompt
@@ -84,7 +86,6 @@ class Conversation:
             s.memory,
             s.reminders,
             s.apps,
-            self._go_to_sleep,
             library=s.library,
         )
         context = LLMContext(
@@ -142,6 +143,7 @@ class Conversation:
             self.announcer.stop()
             self.timer.stop()
             minutes = (time.monotonic() - started) / 60
+            display.status(mode='Say "Hey Alfred"', cost=minutes * VOICE_PER_MINUTE)
             logger.info(
                 f"Session closed after {minutes:.1f} min (~${minutes * VOICE_PER_MINUTE:.2f})"
             )
@@ -158,9 +160,6 @@ class Conversation:
             if any(r.kind == kind for r in due):
                 self.engine.play(self._rings[kind])
                 return
-
-    def _go_to_sleep(self) -> None:
-        self.timer.sleep_after_goodbye()
 
     def _closing(self) -> None:
         self.announcer.closing = True
@@ -194,6 +193,8 @@ class Conversation:
         self.transcript.append(f"{who}: {text}")
         if who == "Alfred":
             self.timer.activity()
+            if is_goodbye(text):
+                self.timer.sleep_after_goodbye()
             if self.timer.sleeping and text:  # the goodbye: say nothing after it
                 self.transport.output().muted = True
                 self.timer.goodbye_said()
@@ -274,6 +275,12 @@ def end_if_out_of_credits(worker) -> asyncio.Event:
     return out
 
 
+def is_goodbye(text: str) -> bool:
+    """Alfred ends a conversation by saying "Goodnight, sir." (prompts/voice.md), so it
+    closes the moment that's played, with no round trip through the delegate."""
+    return re.sub(r"[^a-z ]", "", text.lower()).strip().endswith("goodnight sir")
+
+
 def log_conversation(llm, user_turns, alfred_turns, on_line, on_delegation=None) -> None:
     """Log what was said and each delegation. on_line(who, text) gets every line."""
 
@@ -292,10 +299,12 @@ def log_conversation(llm, user_turns, alfred_turns, on_line, on_delegation=None)
     @user_turns.event_handler("on_user_turn_message_added")
     async def on_user_turn(_aggregator, message):
         logger.info(f"You: {message.content}")
+        display.said("You", str(message.content))
         on_line("You", str(message.content))
 
     @alfred_turns.event_handler("on_assistant_turn_stopped")
     async def on_alfred_turn(_aggregator, message):
         if message.content:
             logger.info(f"Alfred: {message.content}")
+            display.said("Alfred", str(message.content))
         on_line("Alfred", str(message.content or ""))

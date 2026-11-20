@@ -73,8 +73,9 @@ starts Alfred at boot. On a Mac, allow microphone access for your terminal when 
 uv run alfred
 ```
 
-Wait for `Waiting for "Hey Alfred"...`, then speak. Ctrl+C stops him; unfinished tasks
-carry on next time.
+Wait for `Say "Hey Alfred"` in the status bar, then speak. Ctrl+C stops him; unfinished
+tasks carry on next time. The terminal shows the conversation, each answer's steps and
+checked quotes; `uv run alfred --plain` shows the plain log instead.
 
 To run him as a service on the Pi (starts on boot, restarts on failure), see
 [docs/architecture.md](docs/architecture.md#running-as-a-service).

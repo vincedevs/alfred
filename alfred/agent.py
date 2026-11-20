@@ -35,7 +35,7 @@ from claude_agent_sdk import (
 )
 from loguru import logger
 
-from alfred import webcheck
+from alfred import display, webcheck
 from alfred.apps import Apps
 from alfred.audit import AuditLog
 from alfred.config import PROJECT_ROOT, Config, load_prompt
@@ -156,6 +156,7 @@ class Agent:
         self._tasks[task_id] = asyncio.create_task(
             self._run(task_id, project, request, resuming), name=f"task-{task_id}"
         )
+        display.status(tasks=len(self._tasks))
 
     async def _run(self, task_id: int, project: str, request: str, resuming: bool) -> None:
         lock = self._project_locks.setdefault(project, asyncio.Lock())
@@ -174,6 +175,7 @@ class Agent:
             status, result = "failed", f"{type(error).__name__}: {error}"
         finally:
             self._tasks.pop(task_id, None)
+            display.status(tasks=len(self._tasks))
             self._questions.cancel_for_task(task_id)
         self.skills.commit(f"Skills after task {task_id}: {request[:60]}")
         self._db.finish_task(task_id, status, result)
@@ -202,10 +204,12 @@ class Agent:
                 for block in message.content:
                     if isinstance(block, ToolUseBlock):
                         logger.debug(f"Task {task_id} uses {block.name}: {str(block.input)[:200]}")
+                        display.tool(block.name, block.input)
             elif isinstance(message, ResultMessage):
                 outcome = message
         if outcome is None:
             raise RuntimeError("Claude stopped without a result")
+        display.status(cost=outcome.total_cost_usd or 0)
         logger.info(
             f"Task {task_id}: {outcome.num_turns} turns, {outcome.duration_ms / 1000:.0f} s, "
             f"about ${outcome.total_cost_usd or 0:.3f}"
@@ -465,6 +469,7 @@ async def check_answer(library: Library, project: str, pages: Path | None, args:
     if failed or not citations:
         return {"checked": False, "fix": failed or "an answer needs citations, or found: false"}
     library.record(project, args["answer"], citations)
+    display.quotes(citations)
     result: dict = {"checked": True}
     if pages:
         pages.mkdir(parents=True, exist_ok=True)

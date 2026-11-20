@@ -10,6 +10,7 @@ from importlib.metadata import version
 
 from loguru import logger
 
+from alfred import display
 from alfred.config import PROJECT_ROOT, SECRET_SETTINGS, Config
 
 LOG_DIR = PROJECT_ROOT / "logs"
@@ -22,7 +23,10 @@ def setup_logging(config: Config) -> None:
     log_file = LOG_DIR / f"alfred-{config.now():%Y%m%d-%H%M%S}.log"
     logger.remove()
     # diagnose=False: a crash shows where it happened, never the values involved (keys)
-    logger.add(sys.stderr, level=config.log_level, diagnose=False)
+    if display.on:  # the presentation view: only warnings and errors from the log
+        logger.add(lambda m: display.step("⚠", m.record["message"]), level="WARNING")
+    else:
+        logger.add(sys.stderr, level=config.log_level, diagnose=False)
     logger.add(log_file, level="DEBUG", backtrace=True, diagnose=False)
     logger.info(f"Logging everything to {log_file.relative_to(PROJECT_ROOT)}")
     if removed:

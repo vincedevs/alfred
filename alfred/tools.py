@@ -1,14 +1,15 @@
 """The tools GPT-Live's delegate calls (besides web search): hand work to the agent, check
-and answer it, memory, reminders, apps, skills, and going to sleep.
+and answer it, memory, reminders, apps and skills.
 
 Each tool is a plain async function: Pipecat reads its name, docstring and arguments to
 describe it to the model, and runs it here when the model calls it.
 """
 
-from collections.abc import Callable
+import time
 
 from pipecat.services.llm_service import FunctionCallParams
 
+from alfred import display
 from alfred.agent import Agent, check_answer
 from alfred.apps import Apps
 from alfred.db import Database, Task
@@ -27,7 +28,6 @@ def delegate_tools(
     memory: Memory,
     reminders: Reminders,
     apps: Apps,
-    go_to_sleep: Callable[[], None],
     library: Library | None = None,
 ) -> list:
     async def do_task(params: FunctionCallParams, request: str, project: str = ""):
@@ -42,6 +42,7 @@ def delegate_tools(
                 for anything not about a project.
         """
         name = agent.projects.resolve(project)
+        display.step("🧠", "handed to Claude", route="by Claude")
         task_id = agent.start(request, name)
         task = await agent.wait(task_id, QUICK_ANSWER_SECONDS)
         if task.status == "running":
@@ -189,7 +190,11 @@ def delegate_tools(
         Args:
             query: The question's key words.
         """
+        started = time.monotonic()
         found = (await library.search(query))[:5] if library else []
+        display.step("🔎", f"searched your files · {time.monotonic() - started:.1f} s")
+        for hit in found[:1]:
+            display.step("📄", f"{hit['document']} · {hit['location']}")
         waiting = library.waiting_text() if library else ""
         await params.result_callback(
             {"passages": found} | ({"not yet read": waiting} if waiting else {})
@@ -233,19 +238,12 @@ def delegate_tools(
         """
         await params.result_callback({"forgotten": agent.skills.remove(name)})
 
-    async def sleep(params: FunctionCallParams):
-        """The user told Alfred to go to sleep: the conversation ends after his goodbye."""
-        go_to_sleep()
-        await params.result_callback(
-            {"note": "Say nothing more, unless you haven't said goodnight."}
-        )
-
     return [
         do_task, task_status, answer_task, stop_task,
         remember, recall, forget, remind, list_reminders, cancel_reminder,
         list_apps, stop_app, restart_app, list_documents, search_files, check_answer_from_files,
         read_large_scan,
-        list_skills, forget_skill, sleep,
+        list_skills, forget_skill,
     ]  # fmt: skip
 
 

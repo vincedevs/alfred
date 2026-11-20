@@ -139,7 +139,6 @@ def services(tmp_path, run):
         Skills(config.skills_dir),
         run=run,
     )
-    slept = []
     tools = {
         t.__name__: t
         for t in delegate_tools(
@@ -149,10 +148,9 @@ def services(tmp_path, run):
             memory,
             Reminders(db, config.tz),
             Apps(agent.projects, lambda port: f"http://host:{port}/"),
-            lambda: slept.append(1),
         )
     }
-    return db, questions, agent, tools, slept
+    return db, questions, agent, tools
 
 
 def test_the_delegate_hands_work_to_the_agent(tmp_path):
@@ -160,7 +158,7 @@ def test_the_delegate_hands_work_to_the_agent(tmp_path):
         return f"Did it in {project}."
 
     async def main():
-        db, _, _, tools, _ = services(tmp_path, run)
+        db, _, _, tools = services(tmp_path, run)
         params = Params()
         await tools["do_task"](params, request="add a dark mode", project="the Portfolio")
         assert params.result["status"] == "done" and params.result["project"] == "portfolio"
@@ -171,9 +169,9 @@ def test_the_delegate_hands_work_to_the_agent(tmp_path):
     asyncio.run(main())
 
 
-def test_memory_skills_and_sleep_tools(tmp_path):
+def test_memory_and_skills_tools(tmp_path):
     async def main():
-        _, _, _, tools, slept = services(tmp_path, None)
+        _, _, _, tools = services(tmp_path, None)
         params = Params()
         await tools["remember"](params, fact="Prefers direct pushes")
         await tools["recall"](params, about="pushes")
@@ -181,8 +179,6 @@ def test_memory_skills_and_sleep_tools(tmp_path):
         await tools["list_skills"](params)
         names = [skill["name"] for skill in params.result["skills"]]
         assert {"writing-skills", "answering-from-documents"} <= set(names)
-        await tools["sleep"](params)
-        assert slept == [1]
 
     asyncio.run(main())
 
@@ -204,7 +200,7 @@ def test_finished_work_and_questions_are_announced(tmp_path, monkeypatch):
         return "Tests pass."
 
     async def main():
-        db, questions, agent, _, _ = services(tmp_path, run)
+        db, questions, agent, _ = services(tmp_path, run)
         announcer = Announcer(FakeLLM(), db, agent, questions, Reminders(db, ZoneInfo("UTC")))
         notes = []
         monkeypatch.setattr(announcer, "tell", notes.append)
@@ -223,10 +219,17 @@ def test_finished_work_and_questions_are_announced(tmp_path, monkeypatch):
 
 
 def test_news_from_between_conversations_opens_the_next(tmp_path):
-    db, questions, _, _, _ = services(tmp_path, None)
+    db, questions, _, _ = services(tmp_path, None)
     reminders = Reminders(db, ZoneInfo("UTC"))
     assert opening_messages(db, questions, reminders) == ([], [], [])
     task_id = db.add_task("app", "run the tests")
     db.finish_task(task_id, "done", "All green.")
     messages, told, said = opening_messages(db, questions, reminders)
     assert "All green." in messages[0]["content"] and told == [task_id]
+
+
+def test_his_goodbye_ends_the_conversation():
+    from alfred.voice import is_goodbye
+
+    assert is_goodbye("Goodnight, sir.") and is_goodbye("I'll hand that off, sir. Goodnight, sir.")
+    assert not is_goodbye("Goodnight to you too, sir. What else?") and not is_goodbye("Yes, sir.")

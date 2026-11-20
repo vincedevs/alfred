@@ -16,7 +16,7 @@ mic ─► wake word ─► GPT-Live (voice) ─► delegate ─► tools ─►
 |---|---|---|
 | Audio | `audio`, `transport`, `wakeword` | One duplex stream with echo cancellation; the local "Hey Alfred" |
 | Conversation | `voice`, `idle`, `announcer` | A GPT-Live session; closing when quiet; speaking up about tasks and reminders |
-| Delegate tools | `tools` | What GPT-Live's delegate calls: hand work over, answer, memory, reminders, skills, sleep |
+| Delegate tools | `tools` | What GPT-Live's delegate calls: hand work over, answer, memory, reminders, skills |
 | Agent | `agent`, `projects`, `permissions`, `questions`, `audit` | Claude doing the work, in project folders, within three rules |
 | Memory | `memory`, `db` | Facts, the agent's lessons and history in SQLite; learning after each conversation |
 | Reminders | `reminders` | Reminders, timers and alarms in SQLite; the wake loop speaks up (and rings) when one is due |

@@ -90,8 +90,8 @@ def test_an_unchecked_answer_from_the_files_is_held_back_once():
 
 def test_the_delegate_answers_simple_file_questions_itself(run, tmp_path):  # noqa: F811
     async def body(library):
-        _, _, agent, _, _ = services(tmp_path, None)
-        tools = {t.__name__: t for t in delegate_tools(agent, *[None] * 5, None, library=library)}
+        _, _, agent, _ = services(tmp_path, None)
+        tools = {t.__name__: t for t in delegate_tools(agent, *[None] * 5, library=library)}
         await ready(library, "Lease.pdf", pdf_bytes(tmp_path, LEASE))
         params = Params()
         await tools["search_files"](params, query="notice to terminate the lease")
@@ -134,7 +134,7 @@ def test_a_page_is_fetched_from_the_address_checked(monkeypatch, tmp_path):
 
 def test_files_arriving_tell_gpt_live_quietly(run, tmp_path):  # noqa: F811
     async def body(library):
-        db, questions, agent, _, _ = services(tmp_path, None)
+        db, questions, agent, _ = services(tmp_path, None)
         sent = []
 
         class LLM(FakeLLM):

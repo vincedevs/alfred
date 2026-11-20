@@ -14,5 +14,4 @@ or three spoken sentences: no markdown, lists or links.
 - Reminders, timers and alarms (also repeating): remind, list_reminders, cancel_reminder.
 - Running apps: list_apps, stop_app, restart_app.
 - Skills: list_skills, forget_skill.
-- "Go to sleep": sleep.
 - Report what tools return; never invent results or claim it's done before a tool says so.

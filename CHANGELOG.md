@@ -23,6 +23,9 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 - **Quick answers from your files:** the delegate searches them itself (`search_files`)
   and, when one passage answers, says it once `check_answer_from_files` accepts the quote:
   seconds, not the agent's 10–20. Harder questions go to the agent.
+- **A terminal to watch:** the conversation as chat bubbles, each answer's steps and checked
+  quotes, a status bar, and the library page's address. `uv run alfred --plain` shows
+  the plain log; the full log still goes to `logs/`.
 - **Clear the library** on the library page. Library actions now need a header only that
   page sends, so another website can't clear, delete or upload.
 - **`./setup.sh`** installs everything Alfred needs, on the Pi or a Mac.
@@ -39,6 +42,10 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
   `cp skills/answering-from-documents/SKILL.md ~/.alfred/skills/skills/answering-from-documents/`
 
 ### Fixed
+- **"Go to sleep" is instant and reliable:** his "Goodnight, sir." now ends the
+  conversation as soon as it has played; before, it needed a round trip through the
+  delegate, which GPT-Live often skipped, so he stayed awake. The `sleep` tool is gone.
+  His instructions follow OpenAI's GPT-Live template, and he speaks at an unhurried pace.
 - Text saved by Excel on Windows reads right ("Peñafrancia", not "Pe�afrancia"), so quotes
   from it are accepted; UTF-16 text and a CSV's byte-order mark too.
 - A spreadsheet total that is a formula with no saved result showed blank; its formula is

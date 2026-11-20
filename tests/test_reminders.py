@@ -72,7 +72,7 @@ def test_due_reminders_open_the_next_conversation(tmp_path):
 
 def test_a_reminder_due_while_talking_is_said(tmp_path, monkeypatch):
     async def main():
-        db, questions, agent, _, _ = services(tmp_path, None)
+        db, questions, agent, _ = services(tmp_path, None)
         r = Reminders(db, MANILA)
         rang = []
         announcer = Announcer(FakeLLM(), db, agent, questions, r, ring=rang.append)
@@ -91,7 +91,7 @@ def test_a_reminder_due_while_talking_is_said(tmp_path, monkeypatch):
 
 def test_the_delegate_sets_reminders(tmp_path):
     async def main():
-        _, _, _, tools, _ = services(tmp_path, None)
+        _, _, _, tools = services(tmp_path, None)
         params = Params()
         await tools["remind"](params, text="tea", kind="timer", in_minutes=4)
         assert params.result["set"]["text"] == "tea"
