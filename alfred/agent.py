@@ -368,12 +368,14 @@ def library_tools(
 
     @tool(
         "list_documents",
-        "The files in the user's library, whether each is ready, and its file (to calculate "
+        "The files in the user's library, newest first ('the file I just sent' is the newest): "
+        "what each is, when it was added, whether it's ready, and its file (to calculate "
         "from, or to look at a page or picture with Read).",
         {},
     )
     async def list_documents(_args: dict) -> dict:
-        return reply([d.describe() for d in library.documents()] if library else [])
+        docs = library.documents(newest_first=True) if library else []
+        return reply([d.describe() for d in docs])
 
     @tool(
         "search_documents",

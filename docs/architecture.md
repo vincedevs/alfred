@@ -22,7 +22,7 @@ mic ─► wake word ─► GPT-Live (voice) ─► delegate ─► tools ─►
 | Reminders | `reminders` | Reminders, timers and alarms in SQLite; the wake loop speaks up (and rings) when one is due |
 | Skills | `skills` | A git-tracked plugin folder the agent loads natively |
 | Running | `__main__`, `services`, `config`, `logs`, `lock`, `reset` | Start-up, settings, logs |
-| Library | `library`, `webcheck`, `web` | Uploaded files and zips (in resumable pieces) read into located text (Claude vision for scans and pictures, within limits; LibreOffice for old Office files), hybrid keyword and meaning search, the agent's search, read and citation-check tools, quotes checked against files and web pages |
+| Library | `library`, `webcheck`, `web` | Uploaded files and zips (in resumable pieces) read into located text, two at a time, every file's text before any pictures, with a line on what each is (Claude vision for scans, pictures and drawn diagrams, batched in the message and resized, blank and repeated ones skipped, within limits; diagrams' structure from PowerPoint itself; LibreOffice for old Office files), hybrid keyword and meaning search, the agent's search, read and citation-check tools, quotes checked against files and web pages |
 | Apps | `apps`, `web` | Running the apps Alfred builds; the apps page listing them, with static sites and pages |
 | Accounts | `accounts`, `music`, `google` | Logins (OAuth, by hand); Spotify control, turned down while he's awake; Google calendar and Gmail, read-only |
 | Health | `health`, `display` | Checking OpenAI, Claude and the accounts; problems in the status bar and said once; the terminal view |

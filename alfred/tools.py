@@ -192,20 +192,25 @@ def delegate_tools(
         await params.result_callback(await apps.restart(project))
 
     async def list_documents(params: FunctionCallParams):
-        """The files in the user's library (uploaded on the apps page), and whether each is
-        ready. Questions about what they say go to do_task."""
-        docs = [d.describe(with_file=False) for d in library.documents()] if library else []
+        """The files in the user's library (uploaded on the apps page), newest first: what
+        each is, when it was added, and whether it's ready. "The file I just sent" is the
+        newest. Questions about what they say go to do_task."""
+        docs = library.documents(newest_first=True) if library else []
+        docs = [d.describe(with_file=False) for d in docs]
         await params.result_callback({"documents": docs})
 
-    async def search_files(params: FunctionCallParams, query: str):
+    async def search_files(params: FunctionCallParams, query: str, document: str = ""):
         """Search the user's files, fast: the best passages for a question of fact, each
-        with its document and location.
+        with its document and location. Not for summaries, sums or comparing files:
+        do_task.
 
         Args:
             query: The question's key words.
+            document: Only this file (its name, as list_documents gives it), for a question
+                about one file ("this file", "the one I just sent"). Empty: all files.
         """
         started = time.monotonic()
-        found = (await library.search(query))[:5] if library else []
+        found = (await library.search(query, document))[:5] if library else []
         display.step("🔎", f"searched your files · {time.monotonic() - started:.1f} s")
         for hit in found[:1]:
             display.step("📄", f"{hit['document']} · {hit['location']}")

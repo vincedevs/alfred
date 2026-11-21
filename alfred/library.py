@@ -19,6 +19,7 @@ Everything lives in ~/.alfred/library: the files, and library.db.
 """
 
 import asyncio
+import base64
 import codecs
 import csv
 import difflib
@@ -52,16 +53,30 @@ SPREADSHEETS = ROWS | {".xls"}
 CONVERT = {".doc": "docx", ".rtf": "docx", ".odt": "docx", ".ppt": "pptx", ".odp": "pptx",
            ".ods": "xlsx"}  # fmt: skip
 TEXT = {".txt", ".md", ".markdown", ".json", ".xml", ".yaml", ".yml", ".log", ".tsv", ".ini"}
+DESCRIBE_AT_ONCE = 10  # files per Claude call: starting Claude takes longer than the writing
+OPENING = 2000  # characters of a file its description is written from
 PICTURE_BYTES_AT_LEAST = 8000  # smaller ones are icons and logos
-ZIP_FILES_AT_MOST = 5000
-WHOLE_FILE_MB = 100  # MarkItDown reads a file whole: Word, PowerPoint, EPUB, HTML, .xls
+ZIP_FILES_AT_MOST = 50_000
+WHOLE_FILE_MB = 2048  # read whole, into memory: Word, PowerPoint, EPUB, HTML, .xls (a 2 GB
+# deck needs about 3 GB of RAM: fine on an 8 GB Pi 5)
 KEEP_FREE_GB = 10  # the card always keeps this much free
 PAGES_AT_ONCE = 8  # PDF pages read per step; each step is searchable when done
 ROWS_PER_PART = 500
-VISION_PAGES = 4  # page images per Claude call
-VISION_AT_ONCE = 3  # Claude calls in flight
+CLAUDE_EDGE, CLAUDE_PIXELS = 1568, 1_150_000  # the size Claude reads pictures at; bigger
+# ones are shrunk on arrival, so sending more only slows the call
+SENT_AS_IS = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "GIF": ".gif"}  # Claude's kinds
+MEDIA_TYPES = {
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+BLANK_SPREAD = 3.0  # brightness varying less than this: a blank picture, not worth reading
+SEEN_AT_MOST = 20_000  # pictures remembered, so one repeated across files is read once
 TOKENS_PER_SCAN = 2000  # roughly, for a page image and its text
 SCANNED_BELOW = 30  # characters: a page with less text than this is read as an image
+DRAWN_AT_LEAST = 8  # drawn shapes and lines on a page before it may be a diagram
+DRAWN_TEXT_BELOW = 2500  # characters: a page with more is text with rules and tables
 CHUNK, OVERLAP = 1500, 200  # characters
 PART_AT_MOST = 6000  # characters: longer sections are split into parts
 LINES_PER_PART = 80
@@ -85,7 +100,9 @@ CREATE TABLE IF NOT EXISTS documents (
     note        TEXT,                       -- what to know, or what went wrong
     created_at  REAL NOT NULL,
     bytes       INTEGER NOT NULL DEFAULT 0,
-    approved    INTEGER NOT NULL DEFAULT 0  -- yes to reading a large scan
+    approved    INTEGER NOT NULL DEFAULT 0, -- yes to reading a large scan
+    later       INTEGER NOT NULL DEFAULT 0, -- its pictures are read after every file's text
+    about       TEXT                        -- one line on what it is; NULL: not written yet
 );
 CREATE TABLE IF NOT EXISTS parts (            -- the text at each location, in order
     doc_id      TEXT NOT NULL,
@@ -113,6 +130,8 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 # Vision: page images in, their text out (one string per image, in order).
 Vision = Callable[[list[Path]], Awaitable[list[str]]]
+# Describer: (name, opening text) per file in, one line on what each file is out.
+Describer = Callable[[list[tuple[str, str]]], Awaitable[list[str]]]
 # Embedder: texts in, one embedding (DIMENSIONS numbers) per text out.
 Embedder = Callable[[list[str]], Awaitable[list[list[float]]]]
 
@@ -127,10 +146,12 @@ class Unreadable(Exception):
 
 @dataclass
 class Limits:
-    max_mb: float = 500  # per file
+    max_mb: float = 4096  # per file
     max_gb: float = 64  # the whole library
-    ask_pages: int = 200  # scanned pages in one file before asking first
-    daily_pages: int = 1000  # scanned pages read by vision per day
+    ask_pages: int = 10_000  # scanned pages in one file before asking first
+    daily_pages: int = 20_000  # scanned pages and pictures read by vision per day
+    vision_per_call: int = 8  # pictures in one Claude call
+    vision_at_once: int = 4  # Claude calls at once (your plan's rate limit decides)
 
 
 @dataclass
@@ -145,6 +166,8 @@ class Document:
     created_at: float
     bytes: int = 0
     approved: int = 0
+    later: int = 0
+    about: str | None = None
 
     @property
     def suffix(self) -> str:
@@ -173,6 +196,9 @@ class Document:
         return (
             {"document": self.name, "id": self.id, "status": self.status}
             | ({"progress": progress} if progress else {})
+            | ({"about": self.about} if self.about else {})
+            | {"added": ago(self.created_at)}
+            | ({"pictures": "still being read"} if self.later else {})
             | ({"note": self.note} if self.note else {})
             | ({"file": self.readable} if with_file else {})
         )
@@ -193,7 +219,13 @@ class Library:
         limits: Limits | None = None,
         embedder: Embedder | None = None,
         embedding_model: str = "",
+        describer: Describer | None = None,
     ):
+        self._describer = describer
+        self._seen: dict[str, str] = {}  # a picture's fingerprint: what Claude read in it
+        self._describing: asyncio.Task | None = None
+        self._office = asyncio.Lock()  # one LibreOffice at a time: two clash over its profile
+        self._scans = asyncio.Lock()  # pictures: checking and counting scans, as one step
         self.root, self.files, self.incoming = root, root / "files", root / "incoming"
         self.files.mkdir(parents=True, exist_ok=True)
         self.incoming.mkdir(exist_ok=True)
@@ -207,10 +239,11 @@ class Library:
         self.vectors = self._open_vectors(embedding_model) if embedder else False
         self._lock = threading.Lock()  # the upload page calls in from its own thread
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._queue: asyncio.PriorityQueue[tuple[int, int, str]] = asyncio.PriorityQueue()
-        self._queued: set[str] = set()
+        # (pass, size, order, id): every file's text (pass 0) before any pictures (pass 1)
+        self._queue: asyncio.PriorityQueue[tuple[int, int, int, str]] = asyncio.PriorityQueue()
+        self._queued: set[tuple[str, int]] = set()
         self._order = 0
-        self._worker: asyncio.Task | None = None
+        self._workers: list[asyncio.Task] = []
         self._embedding: set[asyncio.Task] = set()  # meaning search catches up behind reading
         self._embed_slots = asyncio.Semaphore(2)
         self.on_ready: list[Callable[[Document], None]] = []
@@ -222,13 +255,17 @@ class Library:
         return int(self.limits.max_mb * 1024 * 1024)
 
     def _add_missing_columns(self) -> None:
-        """A library.db made by 1.1.0's first build lacks the newer columns."""
+        """An older library.db lacks the newer columns."""
         have = {row["name"] for row in self._conn.execute("PRAGMA table_info(documents)")}
-        for column in ("bytes", "approved"):
+        number = "INTEGER NOT NULL DEFAULT 0"
+        for column, kind in (
+            ("bytes", number),
+            ("approved", number),
+            ("later", number),
+            ("about", "TEXT"),
+        ):
             if column not in have:
-                self._conn.execute(
-                    f"ALTER TABLE documents ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
-                )
+                self._conn.execute(f"ALTER TABLE documents ADD COLUMN {column} {kind}")
         self._conn.commit()
 
     def _open_vectors(self, model: str) -> bool:
@@ -263,30 +300,34 @@ class Library:
             self._conn.commit()
             return rows
 
-    def documents(self) -> list[Document]:
-        return [Document(**dict(r)) for r in self._sql("SELECT * FROM documents ORDER BY name")]
+    def documents(self, newest_first: bool = False) -> list[Document]:
+        order = "created_at DESC" if newest_first else "name"
+        return [Document(**dict(r)) for r in self._sql(f"SELECT * FROM documents ORDER BY {order}")]
 
     def get(self, doc_id: str) -> Document | None:
         rows = self._sql("SELECT * FROM documents WHERE id = ?", (doc_id,))
         return Document(**dict(rows[0])) if rows else None
 
     def find(self, ref: str) -> Document | None:
-        """A document by its id or its name, or a word of its name ("the lease")."""
+        """A document by its id or its name, a word of its name, or words of what it's
+        about ("the lease"). Several match: None, never a guess."""
         ref = ref.strip().lower()
-        docs = self.documents()
+        docs, wanted = self.documents(), set(words_in(ref))
         for test in (
             lambda d: d.id == ref or d.name.lower() == ref,
             lambda d: Path(d.name).name.lower() == ref or Path(d.name).stem.lower() == ref,
             lambda d: ref and ref in d.name.lower(),
             lambda d: set(words_in(ref)) & set(words_in(Path(d.name).stem)),
+            lambda d: wanted and wanted <= set(words_in(d.about or "")),  # "the lease"
         ):
             if found := [d for d in docs if test(d)]:
                 return found[0] if len(found) == 1 else None  # several: never guess
         return None
 
-    def contents_text(self) -> str:
+    def contents_text(self, with_about: bool = True) -> str:
         """For every prompt: which files the library holds, so a question they may answer
-        goes to them first, not to the web. Past LISTED_IN_PROMPTS files, a summary."""
+        goes to them first, not to the web. Past LISTED_IN_PROMPTS files, a summary.
+        with_about: what each file is; GPT-Live leaves it out (a longer prompt is slower)."""
         docs = self.documents()
         if not docs:
             return ""
@@ -297,7 +338,9 @@ class Library:
             + "\n"
         )
         if len(docs) <= LISTED_IN_PROMPTS:
-            return intro + "\n".join(f"- {doc.name}{brief(doc)}" for doc in docs)
+            return intro + "\n".join(
+                f"- {doc.name}{brief(doc)}{about(doc) if with_about else ''}" for doc in docs
+            )
         kinds: dict[str, int] = {}
         for doc in docs:
             kind = doc.suffix.lstrip(".").upper() or "other"
@@ -307,7 +350,9 @@ class Library:
         return (
             intro
             + f"{len(docs)} files ({counts}). Newest:\n"
-            + "\n".join(f"- {doc.name}{brief(doc)}" for doc in newest)
+            + "\n".join(
+                f"- {doc.name}{brief(doc)}{about(doc) if with_about else ''}" for doc in newest
+            )
             + "\nFind the rest with list_documents and search_documents."
         )
 
@@ -540,16 +585,19 @@ class Library:
     def start(self) -> None:
         """Start processing, and carry on with files left unfinished by a restart."""
         self._loop = asyncio.get_running_loop()
-        self._worker = asyncio.create_task(self._work(), name="library")
+        self._workers = [asyncio.create_task(self._work(), name=f"library-{n}") for n in (1, 2)]
         for doc in self.documents():
             if doc.status in ("waiting", "processing", "paused"):
                 self._enqueue(doc.id)
+            elif doc.status == "ready" and doc.later:
+                self._enqueue(doc.id, later=True)
+        self._describe_soon()
         for stale in self.incoming.glob("*.part"):  # uploads abandoned over a day ago
             if time.time() - stale.stat().st_mtime > 86400:
                 stale.unlink(missing_ok=True)
 
     async def stop(self) -> None:
-        running = [t for t in (self._worker, *self._embedding) if t]
+        running = [t for t in (*self._workers, self._describing, *self._embedding) if t]
         for task in running:
             task.cancel()
         await asyncio.gather(*running, return_exceptions=True)
@@ -559,24 +607,32 @@ class Library:
         while self._embedding:
             await asyncio.gather(*self._embedding, return_exceptions=True)
 
-    def _enqueue(self, doc_id: str) -> None:
-        if not self._loop or doc_id in self._queued:
+    def _enqueue(self, doc_id: str, later: bool = False) -> None:
+        if not self._loop or (doc_id, later) in self._queued:
             return
         doc = self.get(doc_id)
-        self._queued.add(doc_id)
+        self._queued.add((doc_id, later))
         self._order += 1
-        item = (doc.bytes if doc else 0, self._order, doc_id)  # smallest first
+        item = (int(later), doc.bytes if doc else 0, self._order, doc_id)  # smallest first
         self._loop.call_soon_threadsafe(self._queue.put_nowait, item)
 
     async def _work(self) -> None:
         while True:
             try:
-                _, _, doc_id = await asyncio.wait_for(self._queue.get(), RECHECK_SECONDS)
+                later, _, _, doc_id = await asyncio.wait_for(self._queue.get(), RECHECK_SECONDS)
             except TimeoutError:
                 await self._idle()
                 continue
-            self._queued.discard(doc_id)
+            self._queued.discard((doc_id, bool(later)))
             doc = self.get(doc_id)
+            if later:
+                if doc and doc.later and doc.status == "ready":
+                    try:
+                        await self._read_later(doc)
+                    except Exception:  # its text stays searchable; only the pictures are lost
+                        logger.exception(f"Library: couldn't read the pictures in {doc.name}")
+                        self._set(doc.id, later=0, note="Its pictures couldn't be read.")
+                continue
             if not doc or doc.status in ("ready", "asking", "failed"):
                 continue
             started = time.monotonic()
@@ -601,8 +657,38 @@ class Library:
             logger.info(f"Library: {doc.name} ready in {time.monotonic() - started:.0f} s")
             for listener in list(self.on_ready):
                 listener(self.get(doc.id))
+            if (self.get(doc.id) or doc).later:
+                self._enqueue(doc.id, later=True)
+            self._describe_soon()
             if self._queue.empty():
                 await self._idle()
+
+    def _describe_soon(self) -> None:
+        if (
+            self._describer
+            and self._loop
+            and not (self._describing and not self._describing.done())
+        ):
+            self._describing = asyncio.create_task(self._describe_all(), name="describe")
+
+    async def _describe_all(self) -> None:
+        """One line on what each ready file is, DESCRIBE_AT_ONCE files per call, behind
+        the reading. A file Claude says nothing about gets "" (not asked again)."""
+        while todo := [d for d in self.documents() if d.status == "ready" and d.about is None]:
+            batch = todo[:DESCRIBE_AT_ONCE]
+            openings = [(d.name, self._opening(d)) for d in batch]
+            try:
+                lines = await self._describer(openings)
+            except Exception as error:  # tried again when the next file is ready
+                logger.warning(f"Library: couldn't describe files: {error}")
+                return
+            for doc, line in zip_longest(batch, lines[: len(batch)], fillvalue=""):
+                self._set(doc.id, about=" ".join(str(line).split())[:200])
+
+    def _opening(self, doc: Document) -> str:
+        parts = self._parts(doc.id)
+        places = ", ".join(p["location"] for p in parts[:15])
+        return f"Parts: {places}\n" + "\n".join(p["text"] for p in parts)[:OPENING]
 
     async def _idle(self) -> None:
         """Between files: embed chunks that missed out (offline earlier, or a new model),
@@ -620,7 +706,8 @@ class Library:
         """Read a document. False if it stopped to wait (a yes, or tomorrow's scans)."""
         path, suffix = Path(doc.path), doc.suffix
         if suffix in CONVERT:
-            await asyncio.to_thread(convert, path, doc.converted, self.root)
+            async with self._office:
+                await asyncio.to_thread(convert, path, doc.converted, self.root)
             path, suffix = doc.converted, doc.converted.suffix
         elif suffix not in PDF | IMAGES | MARKDOWN | ROWS | TEXT:
             await asyncio.to_thread(must_be_text, path, suffix)
@@ -634,21 +721,22 @@ class Library:
                 return False
             self._count_scans(1)
             with tempfile.TemporaryDirectory() as folder:
-                png = Path(folder) / "page-1.png"
-                if not await asyncio.to_thread(save_png, path.read_bytes(), png):
+                image = await asyncio.to_thread(save_picture, path.read_bytes(), Path(folder) / "1")
+                if not image:
                     raise Unreadable("Alfred can't open this image.")
-                parts = [Part("page 1", (await self._see([png]))[0], scanned=True)]
+                parts = [Part("page 1", (await self._see([image]))[0], scanned=True)]
         elif suffix in MARKDOWN:
             markdown = await asyncio.to_thread(to_markdown, path)
             text = sections(markdown, suffix) + (word_charts(path) if suffix == ".docx" else [])
-            self._set(doc.id, total=len(text))
-            await self._store(doc, 0, text)  # searchable now; the pictures follow
-            parts = await self._pictures(doc, path, suffix, first=len(text))
-            if parts:
-                self._set(doc.id, total=len(text) + len(parts))
-                await self._store(doc, len(text), parts)
-            self._set(doc.id, done=len(text) + len(parts))
+            if suffix == ".pptx":
+                text += (await asyncio.to_thread(slide_diagrams, path))[0]  # exact, no Claude
+            await self._store(doc, 0, text)
+            later = int(bool(self._vision) and suffix in (".docx", ".pptx"))
+            self._set(doc.id, total=len(text), done=len(text), later=later)
             parts = []
+        elif suffix in (".md", ".markdown") and path.stat().st_size <= WHOLE_FILE_MB << 20:
+            markdown = await asyncio.to_thread(path.read_text, text_encoding(path), "replace")
+            parts = sections(markdown, suffix)  # by its headings: "§ Installation"
         else:  # spreadsheets and text: read a batch at a time, whatever the size
             batches = row_batches(path) if suffix in ROWS else line_batches(path)
             done = 0
@@ -665,20 +753,64 @@ class Library:
             self._set(doc.id, note="Figures are worked out from the file itself.")
         return True
 
+    async def _read_later(self, doc: Document) -> None:
+        """The second pass, once every file's text is in: a Word or PowerPoint file's
+        pictures, and a deck's slides with loose drawings, as Claude sees them."""
+        path = Path(doc.readable)
+        parts = await self._pictures(doc, path, path.suffix.lower(), first=doc.total)
+        if path.suffix.lower() == ".pptx":
+            parts += await self._drawings(doc, path, first=doc.total + len(parts))
+        if parts and self.get(doc.id):
+            await self._store(doc, doc.total, parts)
+            self._set(doc.id, total=doc.total + len(parts), done=doc.total + len(parts))
+        self._set(doc.id, later=0)
+
+    async def _drawings(self, doc: Document, path: Path, first: int) -> list[Part]:
+        """Slides whose drawings record no joins, drawn by LibreOffice (as a PDF, one page a
+        slide) and read by Claude, within the daily scan limit."""
+        _, loose, slides = await asyncio.to_thread(slide_diagrams, path)
+        if not loose or not libreoffice():
+            return []
+        with tempfile.TemporaryDirectory() as folder:
+            pdf = Path(folder) / f"{doc.id}.pdf"
+            try:
+                async with self._office:
+                    await asyncio.to_thread(convert, path, pdf, self.root, SLIDES_AS_PDF)
+            except Unreadable as error:  # the deck's pictures and text stay as they are
+                logger.warning(f"Library: couldn't draw {doc.name}'s slides: {error}")
+                return []
+            if await asyncio.to_thread(page_count, pdf) != slides:
+                logger.warning(f"Library: {doc.name}'s slides didn't come out one a page")
+                return []
+            async with self._scans:
+                loose = loose[: max(self.scans_left(), 0)]
+                self._count_scans(len(loose))
+            shown = await asyncio.to_thread(slide_pictures, pdf, loose, doc.media, first)
+        texts = await self._see([image for _, image in shown])
+        return [
+            Part(f"slide {n}, drawing", text, True)
+            for (n, _), text in zip(shown, texts, strict=True)
+        ]
+
     async def _pictures(self, doc: Document, path: Path, suffix: str, first: int) -> list[Part]:
         """Charts, diagrams and photos in a Word or PowerPoint file, read by vision (within
         the daily scan limit), each saved as <its part's number>.png for the agent to see."""
         found = pictures_in(path, suffix) if self._vision and suffix in (".docx", ".pptx") else []
-        if len(found) > (left := max(self.scans_left(), 0)):
-            self._set(doc.id, note=f"{len(found) - left} picture(s) not read: today's scan limit")
         kept: list[tuple[str, Path]] = []
-        for at, picture in found[:left]:
-            png = doc.media / f"{first + len(kept)}.png"
-            if await asyncio.to_thread(save_png, picture, png):  # not a drawing Pillow can't open
-                kept.append((at, png))
+        async with self._scans:
+            if len(found) > (left := max(self.scans_left(), 0)):
+                self._set(
+                    doc.id, note=f"{len(found) - left} picture(s) not read: today's scan limit"
+                )
+            for at, picture in found[:left]:  # skipping drawings Pillow can't open
+                saved = await asyncio.to_thread(
+                    save_picture, picture, doc.media / str(first + len(kept))
+                )
+                if saved:
+                    kept.append((at, saved))
+            self._count_scans(len(kept))
         if not kept:
             return []
-        self._count_scans(len(kept))
         texts = await self._see([png for _, png in kept])
         return [Part(at, text, scanned=True) for (at, _), text in zip(kept, texts, strict=True)]
 
@@ -714,11 +846,11 @@ class Library:
             for start in range((self.get(doc.id) or doc).done, total, PAGES_AT_ONCE):
                 pages = await asyncio.to_thread(pdf_pages, path, start, PAGES_AT_ONCE, Path(folder))
                 pages, out_of_scans = within_budget(pages, self.scans_left())
+                images = [image for _, image in pages if image]
+                self._count_scans(len(images))
                 if not pages:
                     self._set(doc.id, status="paused", note=paused_note())
                     return False
-                images = [image for _, image in pages if image]
-                self._count_scans(len(images))
                 seen = iter(await self._see(images)) if images else iter(())
                 parts, pictures = [], []
                 for i, (text, image) in enumerate(pages):
@@ -757,18 +889,32 @@ class Library:
             )
 
     async def _see(self, images: list[Path]) -> list[str]:
-        """Transcribe page images with Claude vision, a few per call, a few calls at once."""
+        """Pictures read by Claude, a few per call, a few calls at once. A blank one isn't
+        sent, nor one read before (a template or a chart repeated across files)."""
         if not self._vision:
             return ["[unclear: scanned page, no vision configured]"] * len(images)
-        slots = asyncio.Semaphore(VISION_AT_ONCE)
+        prints = [hashlib.sha256(image.read_bytes()).hexdigest() for image in images]
+        texts = [self._seen.get(p) for p in prints]
+        for i, image in enumerate(images):
+            if texts[i] is None and await asyncio.to_thread(blank, image):
+                texts[i] = "[blank]"
+        todo = [i for i, text in enumerate(texts) if text is None]
+        slots, size = asyncio.Semaphore(self.limits.vision_at_once), self.limits.vision_per_call
 
-        async def batch(group: list[Path]) -> list[str]:
+        async def batch(group: list[int]) -> list[str]:
             async with slots:
-                texts = await self._vision(group)
-            return (texts + ["[unclear]"] * len(group))[: len(group)]
+                read = await self._vision([images[i] for i in group])
+            return (read + ["[unclear]"] * len(group))[: len(group)]
 
-        groups = [images[i : i + VISION_PAGES] for i in range(0, len(images), VISION_PAGES)]
-        return [text for texts in await asyncio.gather(*map(batch, groups)) for text in texts]
+        groups = [todo[i : i + size] for i in range(0, len(todo), size)]
+        for group, read in zip(groups, await asyncio.gather(*map(batch, groups)), strict=True):
+            for i, text in zip(group, read, strict=True):
+                texts[i] = text
+                if text != "[unclear]":
+                    self._seen[prints[i]] = text
+        while len(self._seen) > SEEN_AT_MOST:
+            self._seen.pop(next(iter(self._seen)))
+        return texts
 
     async def _store(self, doc: Document, first: int, parts: list[Part]) -> None:
         """Keep the parts and their chunks (searchable by keyword at once), and embed the
@@ -812,9 +958,13 @@ class Library:
             except Exception as error:
                 logger.warning(f"Library: couldn't embed ({error}); keyword search meanwhile")
                 return False
-            with self._lock:
+            with self._lock:  # delete first: vec0 ignores OR REPLACE, and two embeddings of
+                # the same chunks can race (a file's own, and the idle catch-up)
                 self._conn.executemany(
-                    "INSERT OR REPLACE INTO vectors (rowid, embedding) VALUES (?, ?)",
+                    "DELETE FROM vectors WHERE rowid = ?", [(r,) for r, _ in batch]
+                )
+                self._conn.executemany(
+                    "INSERT INTO vectors (rowid, embedding) VALUES (?, ?)",
                     [(rowid, packed(v)) for (rowid, _), v in zip(batch, vectors, strict=True)],
                 )
                 self._conn.commit()
@@ -909,7 +1059,7 @@ class Library:
                 break
             text += piece[:READ_AT_MOST]
             shown.append(part["location"])
-            if (picture := doc.media / f"{part['ord']}.png").exists():
+            if picture := next(doc.media.glob(f"{part['ord']}.*"), None):
                 pictures.append(str(picture))
         more = chosen[len(shown) :]
         return (
@@ -996,6 +1146,24 @@ def brief(doc: Document) -> str:
     details = [f"{doc.total} {unit}"] if doc.total and doc.status == "ready" else []
     details += [] if doc.status == "ready" else [doc.status]
     return f" ({', '.join(details)})" if details else ""
+
+
+def about(doc: Document) -> str:
+    return f": {doc.about}" if doc.about else ""
+
+
+def ago(when: float) -> str:
+    """ "just now", "5 min ago", "3 h ago", "20 Nov": when a file was added."""
+    seconds = time.time() - when
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60:.0f} min ago"
+    return (
+        f"{seconds // 3600:.0f} h ago"
+        if seconds < 86400
+        else time.strftime("%d %b", time.localtime(when))
+    )
 
 
 def amount(tokens: int) -> str:
@@ -1168,8 +1336,34 @@ def libreoffice() -> str | None:
     return shutil.which("soffice") or (mac if Path(mac).exists() else None)
 
 
-def convert(path: Path, copy: Path, root: Path) -> None:
-    """An old Office file as its modern kind (`copy`'s suffix), by LibreOffice."""
+SLIDES_AS_PDF = 'pdf:impress_pdf_Export:{"ExportHiddenSlides":{"type":"boolean","value":"true"}}'
+
+
+def slide_pictures(
+    pdf: Path, numbers: list[int], media: Path, first: int
+) -> list[tuple[int, Path]]:
+    """Slides (pages of the deck's PDF) drawn at the size Claude reads them, kept with the
+    file's pictures for the agent to look at again."""
+    import pypdfium2 as pdfium
+
+    document, shown = pdfium.PdfDocument(pdf), []
+    try:
+        for number in numbers:
+            page = document[number - 1]
+            width, height = page.get_size()
+            scale = min(200 / 72, (CLAUDE_PIXELS / (width * height)) ** 0.5)
+            saved = save_picture(page.render(scale=scale).to_pil(), media / str(first + len(shown)))
+            page.close()
+            if saved:
+                shown.append((number, saved))
+    finally:
+        document.close()
+    return shown
+
+
+def convert(path: Path, copy: Path, root: Path, to: str = "") -> None:
+    """An Office file as another kind (`copy`'s suffix, or `to`: a LibreOffice filter), by
+    LibreOffice."""
     if not (office := libreoffice()):
         install = "brew install --cask libreoffice" if sys.platform == "darwin" else "./setup.sh"
         raise Unreadable(f"To read {path.suffix} files, install LibreOffice: {install}")
@@ -1177,7 +1371,7 @@ def convert(path: Path, copy: Path, root: Path) -> None:
     with tempfile.TemporaryDirectory() as folder:
         try:
             subprocess.run(
-                [office, "--headless", profile, "--convert-to", copy.suffix[1:], "--outdir",
+                [office, "--headless", profile, "--convert-to", to or copy.suffix[1:], "--outdir",
                  folder, path],
                 capture_output=True, timeout=120,
             )  # fmt: skip
@@ -1221,6 +1415,105 @@ def unique_blobs(items):
             yield at, blob
 
 
+OOXML = {
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
+    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "dgm": "http://schemas.openxmlformats.org/drawingml/2006/diagram",
+}
+DRAWN_SHAPES = ("arrow", "Arrow", "flowChart", "chevron", "curved", "line")  # shapes, no joins
+
+
+def slide_diagrams(path: Path) -> tuple[list[Part], list[int], int]:
+    """A deck's diagrams, read from the file itself: SmartArt as its outline, and boxes
+    joined by arrows as "A → B" (PowerPoint records which shapes an arrow joins). Also
+    the slides whose drawings record no joins (loose arrows, block arrows, freehand
+    shapes), for Claude to look at instead, and how many slides there are. A slide whose
+    diagram can't be read is left to its text."""
+    from pptx import Presentation
+
+    slides = Presentation(path).slides
+    parts, loose = [], []
+    for number, slide in enumerate(slides, start=1):
+        try:
+            found, unclear = diagrams_on(slide)
+        except Exception:  # a diagram this doesn't understand: the slide's text still counts
+            logger.debug(f"Library: couldn't read the diagrams on slide {number} of {path.name}")
+            continue
+        parts += [
+            Part(f"slide {number}, diagram" + (f" {n}" if len(found) > 1 else ""), text)
+            for n, text in enumerate(found, start=1)
+        ]
+        if unclear:
+            loose.append(number)
+    return parts, loose, len(slides)
+
+
+def diagrams_on(slide) -> tuple[list[str], bool]:
+    """A slide's diagrams as text, and whether it has drawings that record no joins."""
+    root = slide.element
+    names = {
+        int(c.get("id")): words(c.getparent().getparent()) or c.get("name", "")
+        for c in root.iterfind(".//p:cNvPr", OOXML)
+    }
+    joins, unjoined = [], 0
+    for join in root.iterfind(".//p:cNvCxnSpPr", OOXML):
+        start, end = join.find("a:stCxn", OOXML), join.find("a:endCxn", OOXML)
+        if start is None or end is None:
+            unjoined += 1
+        else:
+            joins.append(
+                f"{names.get(int(start.get('id')), '?')} → {names.get(int(end.get('id')), '?')}"
+            )
+    smartart = [
+        smartart_outline(slide.part.related_part(rid).blob)
+        for ids in root.iterfind(".//dgm:relIds", OOXML)
+        if (rid := ids.get(f"{{{OOXML['r']}}}dm"))
+    ]
+    found = [f"Diagram:\n{o}" for o in smartart if o]
+    if joins:
+        found.append("Diagram (arrows between shapes):\n" + "\n".join(f"- {j}" for j in joins))
+    drawn = 0
+    for shape in root.iterfind(".//p:sp/p:spPr", OOXML):
+        preset = shape.find("a:prstGeom", OOXML)
+        kind = preset.get("prst", "") if preset is not None else ""
+        drawn += shape.find("a:custGeom", OOXML) is not None or any(k in kind for k in DRAWN_SHAPES)
+    return found, bool(unjoined or (drawn >= 2 and not found))
+
+
+def smartart_outline(data: bytes) -> str:
+    """A SmartArt diagram's boxes as a nested list, from its data model: every box's text,
+    and which box belongs under which."""
+    from lxml import etree
+
+    root = etree.fromstring(data)
+    kinds, text = {}, {}
+    for point in root.iterfind(".//dgm:pt", OOXML):
+        kinds[point.get("modelId")] = point.get("type", "node")
+        text[point.get("modelId")] = words(point)
+    under: dict[str, list[tuple[int, str]]] = {}
+    for link in root.iterfind(".//dgm:cxn", OOXML):
+        if link.get("type", "parOf") == "parOf" and link.get("destId") in kinds:
+            under.setdefault(link.get("srcId"), []).append(
+                (int(link.get("srcOrd", 0)), link.get("destId"))
+            )
+
+    def lines(model: str, depth: int):
+        for _, child in sorted(under.get(model, [])):
+            if depth < 12 and kinds.get(child) in ("node", "asst"):
+                if text[child]:
+                    yield "  " * depth + "- " + text[child]
+                yield from lines(child, depth + 1)
+
+    top = next((m for m, kind in kinds.items() if kind == "doc"), None)
+    return "\n".join(lines(top, 0)) if top else ""
+
+
+def words(element) -> str:
+    """An XML element's text, its runs joined."""
+    return " ".join(" ".join(t.text or "" for t in element.iterfind(".//a:t", OOXML)).split())
+
+
 def word_charts(path: Path) -> list[Part]:
     """A Word file's charts, as the data Word keeps inside each one (Word's reader skips
     charts): "chart 1, sheet Sheet1, rows 2-5"."""
@@ -1234,22 +1527,49 @@ def word_charts(path: Path) -> list[Part]:
     return found
 
 
-def save_png(picture: bytes, png: Path) -> bool:
-    """A picture as a PNG Claude can read, at most 2,000 pixels a side. False for one
-    Pillow can't open (an EMF drawing)."""
+def save_picture(picture, stem: Path) -> Path | None:
+    """A picture (bytes, or a rendered page) saved for Claude, at the size Claude reads it:
+    as it came if it's already a JPEG, PNG, WebP or GIF of that size; else a PNG for a
+    drawing (few colours) or a JPEG for a photo or scan. None for one Pillow can't open
+    (an EMF drawing)."""
     from io import BytesIO
 
     from PIL import Image, UnidentifiedImageError
 
     try:
-        with Image.open(BytesIO(picture)) as image:
-            png.parent.mkdir(parents=True, exist_ok=True)
-            image = image.convert("RGB")
-            image.thumbnail((2000, 2000))
-            image.save(png)
-    except (UnidentifiedImageError, OSError):
-        return False
-    return True
+        image = picture if isinstance(picture, Image.Image) else Image.open(BytesIO(picture))
+        width, height = image.size
+        scale = min(
+            1.0, CLAUDE_EDGE / max(width, height), (CLAUDE_PIXELS / (width * height)) ** 0.5
+        )
+        stem.parent.mkdir(parents=True, exist_ok=True)
+        kind = SENT_AS_IS.get(image.format or "")
+        if (
+            isinstance(picture, bytes)
+            and kind
+            and scale == 1
+            and not getattr(image, "is_animated", 0)
+        ):
+            (saved := stem.with_suffix(kind)).write_bytes(picture)
+            return saved
+        image = image.convert("RGB")
+        if scale < 1:
+            size = (max(1, int(width * scale + 1e-6)), max(1, int(height * scale + 1e-6)))
+            image = image.resize(size)  # rounded down: within Claude's size, never over
+        drawing = image.getcolors(maxcolors=256) is not None
+        saved = stem.with_suffix(".png" if drawing else ".jpg")
+        image.save(saved, **({} if drawing else {"quality": 90}))
+        return saved
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
+        return None
+
+
+def blank(image: Path) -> bool:
+    """Nearly one colour all over: a blank page or a background, nothing to read."""
+    from PIL import Image, ImageStat
+
+    with Image.open(image) as opened:
+        return ImageStat.Stat(opened.convert("L")).stddev[0] < BLANK_SPREAD
 
 
 def zip_name(member: zipfile.ZipInfo) -> str:
@@ -1288,8 +1608,9 @@ def page_count(path: Path) -> int:
 
 def pdf_pages(path: Path, start: int, count: int, folder: Path) -> list[tuple[str, Path | None]]:
     """(text, None) for each page with text; ("", image) for a page that needs reading
-    as an image (a scan); (text, image) for a page of text with a large picture on it, a
-    quarter of the page or more (a chart, not a logo)."""
+    as an image (a scan); (text, image) for a page of text with a large picture or drawing
+    on it, a quarter of the page or more (a chart or a diagram, not a logo or a rule).
+    Pages are drawn at the size Claude reads them."""
     import pypdfium2 as pdfium
 
     pdf = pdfium.PdfDocument(path)
@@ -1309,14 +1630,36 @@ def pdf_pages(path: Path, start: int, count: int, folder: Path) -> list[tuple[st
                 )
             )
             text = text if len(text) >= SCANNED_BELOW else ""
-            image = folder / f"page-{i + 1}.png" if pictured or not text else None
-            if image:
-                page.render(scale=200 / 72).to_pil().save(image)
+            image = None
+            if (
+                pictured
+                or not text
+                or (len(text) < DRAWN_TEXT_BELOW and drawn(page, width, height))
+            ):
+                scale = min(200 / 72, (CLAUDE_PIXELS / (width * height)) ** 0.5)
+                image = save_picture(page.render(scale=scale).to_pil(), folder / f"page-{i + 1}")
             pages.append((text, image))
             page.close()
     finally:
         pdf.close()
     return pages
+
+
+def drawn(page, width: float, height: float) -> bool:
+    """A diagram drawn with lines and shapes (no picture in it): enough drawn pieces,
+    spread over a quarter of the page or more."""
+    pieces = [
+        bounds
+        for bounds in (o.get_bounds() for o in page.get_objects(filter=[2]))  # 2: drawn
+        if (bounds[2] - bounds[0]) * (bounds[3] - bounds[1]) >= width * height / 1000
+        or bounds[2] - bounds[0] >= width / 10  # a line or an arrow: thin but long
+        or bounds[3] - bounds[1] >= height / 10
+    ]
+    if len(pieces) < DRAWN_AT_LEAST:
+        return False
+    left, bottom = min(b[0] for b in pieces), min(b[1] for b in pieces)
+    right, top = max(b[2] for b in pieces), max(b[3] for b in pieces)
+    return (right - left) * (top - bottom) >= width * height / 4
 
 
 def to_markdown(path: Path) -> str:
@@ -1480,38 +1823,82 @@ def short(text: str, at_most: int = 70) -> str:
     return text if len(text) <= at_most else text[:at_most].rsplit(" ", 1)[0].rstrip(",.;:") + "…"
 
 
-def claude_vision(model: str) -> Vision:
-    """Claude reads page images (through the Agent SDK, so on your Claude plan)."""
+def claude_describer(model: str) -> Describer:
+    """Claude writes one line on what each file is (through the Agent SDK, on your plan)."""
     from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
     instructions = (
-        "You transcribe document page images exactly. For each image, in the order given, "
-        "write a line '=== <file name> ===' and then the page's text word for word: no "
-        "corrections, no summaries, no commentary. Keep tables as Markdown tables. Describe a "
-        "chart, diagram or photo fully in [brackets]: its title, every label, value, axis "
-        "and legend you can read. Write [unclear] for anything you cannot read. Read every "
-        "image with the Read tool first."
+        "For each file, write one line of at most 20 words: what it is, who or what it "
+        'concerns, and its date if shown ("Lease for Unit 4B, Makati, signed March 2024"). '
+        'Reply with only a JSON object: {"1": "...", "2": "..."}, one per file, in order.'
     )
 
-    async def see(images: list[Path]) -> list[str]:
+    async def describe(files: list[tuple[str, str]]) -> list[str]:
+        listing = "\n\n".join(
+            f"=== {n} === {name}\n{opening}" for n, (name, opening) in enumerate(files, 1)
+        )
         options = ClaudeAgentOptions(
             model=model,
             system_prompt=instructions,
-            tools=["Read"],
-            allowed_tools=["Read"],
+            tools=[],
+            max_turns=1,
             setting_sources=[],
-            cwd=images[0].parent,
-            max_turns=len(images) + 3,
+            cwd=tempfile.gettempdir(),
         )
-        files = "\n".join(str(image) for image in images)
         answer = ""
-        async for message in query(prompt=f"Transcribe these pages:\n{files}", options=options):
+        async for message in query(prompt=listing, options=options):
             if isinstance(message, ResultMessage):
                 answer = message.result or ""
+        lines = json.loads(answer[answer.find("{") : answer.rfind("}") + 1] or "{}")
+        return [str(lines.get(str(n), "")) for n in range(1, len(files) + 1)]
+
+    return describe
+
+
+def claude_vision(model: str) -> Vision:
+    """Claude reads pictures (through the Agent SDK, so on your Claude plan). They go in
+    the message itself, so Claude reads them all in one turn."""
+    from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+
+    instructions = (
+        "You transcribe document page images exactly. Each image follows a line "
+        "'=== <number> ==='. For each, in order, write that line and then the page's text "
+        "word for word: no corrections, no summaries, no commentary. Keep tables as Markdown "
+        "tables. Describe a chart or photo fully in [brackets]: its title, every label, value, "
+        "axis and legend you can read. For a diagram (a flowchart, org chart or process), give "
+        "every box and how they connect, as a nested list or as arrows (A → B). Write "
+        "[unclear] for anything you cannot read."
+    )
+
+    async def see(images: list[Path]) -> list[str]:
+        content: list[dict] = [{"type": "text", "text": "Transcribe these pages."}]
+        for number, image in enumerate(images, start=1):
+            data = base64.b64encode(image.read_bytes()).decode()
+            source = {"type": "base64", "media_type": MEDIA_TYPES[image.suffix], "data": data}
+            content += [
+                {"type": "text", "text": f"=== {number} ==="},
+                {"type": "image", "source": source},
+            ]
+
+        async def message():
+            yield {"type": "user", "message": {"role": "user", "content": content}}
+
+        options = ClaudeAgentOptions(
+            model=model,
+            system_prompt=instructions,
+            tools=[],
+            max_turns=1,
+            setting_sources=[],
+            cwd=tempfile.gettempdir(),
+        )
+        answer = ""
+        async for result in query(prompt=message(), options=options):
+            if isinstance(result, ResultMessage):
+                answer = result.result or ""
         texts = {}
         for block in re.split(r"^=== ", answer, flags=re.MULTILINE)[1:]:
-            name, _, text = block.partition("\n")
-            texts[name.strip(" =")] = text.strip()
-        return [texts.get(image.name, "[unclear]") for image in images]
+            number, _, text = block.partition("\n")
+            texts[number.strip(" =")] = text.strip()
+        return [texts.get(str(n), "[unclear]") for n in range(1, len(images) + 1)]
 
     return see

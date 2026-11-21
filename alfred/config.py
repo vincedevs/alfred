@@ -30,10 +30,12 @@ class Config:
     agent_model: str = "claude-haiku-5-5"  # the agent that does the work
     agent_max_turns: int = 200  # a safety stop for work that goes round in circles
     vision_model: str = ""  # reads scanned pages and images; empty: the agent's model
-    library_max_mb: float = 500.0  # the largest file the library takes
+    library_max_mb: float = 4096.0  # the largest file the library takes
     library_max_gb: float = 64.0  # the whole library
-    vision_ask_pages: int = 200  # scanned pages in one file before he asks first
-    vision_daily_pages: int = 1000  # scanned pages Claude reads per day, at most
+    vision_ask_pages: int = 10_000  # scanned pages in one file before he asks first
+    vision_daily_pages: int = 20_000  # scanned pages and pictures Claude reads per day
+    vision_per_call: int = 8  # pictures in one Claude call
+    vision_at_once: int = 4  # Claude calls at once; more is faster, if your plan allows
     embedding_model: str = "text-embedding-3-large"  # the library's meaning search
     github_token: str | None = field(default=None, repr=False)  # for git and gh
     wakeword_dir: Path = PROJECT_ROOT / "models"
@@ -110,12 +112,14 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         agent_model=env.get("ALFRED_AGENT_MODEL") or d.agent_model,
         agent_max_turns=int(_number(env, "ALFRED_AGENT_MAX_TURNS", d.agent_max_turns, 1, 10_000)),
         vision_model=env.get("ALFRED_VISION_MODEL") or d.vision_model,
-        library_max_mb=_number(env, "ALFRED_LIBRARY_MAX_MB", d.library_max_mb, 1, 5_000),
+        library_max_mb=_number(env, "ALFRED_LIBRARY_MAX_MB", d.library_max_mb, 1, 20_000),
         library_max_gb=_number(env, "ALFRED_LIBRARY_MAX_GB", d.library_max_gb, 1, 10_000),
         vision_ask_pages=int(_number(env, "ALFRED_VISION_ASK_PAGES", d.vision_ask_pages, 0, 1e6)),
         vision_daily_pages=int(
             _number(env, "ALFRED_VISION_DAILY_PAGES", d.vision_daily_pages, 0, 1e7)
         ),
+        vision_per_call=int(_number(env, "ALFRED_VISION_PER_CALL", d.vision_per_call, 1, 20)),
+        vision_at_once=int(_number(env, "ALFRED_VISION_AT_ONCE", d.vision_at_once, 1, 16)),
         embedding_model=env.get("ALFRED_EMBEDDING_MODEL") or d.embedding_model,
         github_token=(env.get("ALFRED_GITHUB_TOKEN") or "").strip() or None,
         wakeword_dir=Path(env.get("ALFRED_WAKEWORD_DIR") or d.wakeword_dir),

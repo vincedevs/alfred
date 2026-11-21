@@ -136,7 +136,7 @@ Latency and turn-taking are measured with fd-benchmark: [docs/benchmarking.md](d
 Talking costs about $0.05 a minute (OpenAI). The agent's tasks are billed by Claude; each
 one's cost is in the log. Nothing is sent before "Hey Alfred", except when he speaks up
 about a task. Scanned pages and images in the library are read by Claude (about 2,000
-tokens a page; he asks before a large scan, and reads at most 1,000 pages a day); text
-PDFs and Office files are read on the Pi. For meaning search, the text of every file goes
+tokens a page; he asks before a scan of over 10,000 pages, and reads at most 20,000 a
+day); text PDFs and Office files are read on the Pi. For meaning search, the text of every file goes
 to OpenAI to be embedded (about $1 per 10,000 pages, once). Your voice goes to OpenAI and the agent's work to Claude; everything he keeps
 stays in `~/.alfred`.

@@ -2,6 +2,7 @@
 Claude vision is a stand-in here; the files are made on the spot."""
 
 import asyncio
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -53,13 +54,21 @@ def make(tmp_path, embedder=fake_embedder, **limits) -> Library:
     return Library(tmp_path / "library", fake_vision, Limits(**limits), embedder, "fake")
 
 
+def scan(path, size=(400, 300)):
+    """A picture standing in for a scan: no text layer, and not blank."""
+    Image.frombytes("RGB", size, os.urandom(size[0] * size[1] * 3)).save(path)
+    return path
+
+
 def pdf_bytes(tmp_path, pages: list[str]) -> bytes:
     pdf = FPDF()
     for text in pages:
         pdf.add_page()
-        if text:  # an empty page stands in for a scan: no text layer
+        if text:
             pdf.set_font("Helvetica", size=11)
             pdf.multi_cell(0, 7, text)
+        else:  # a scan: a picture of the page, no text layer
+            pdf.image(str(scan(tmp_path / "scan.png")), x=10, y=10, w=190)
     path = tmp_path / "made.pdf"
     pdf.output(str(path))
     return path.read_bytes()
@@ -78,7 +87,7 @@ async def ready(library: Library, name: str, data: bytes):
     doc, _ = library.add(name, data)
     for _ in range(400):
         doc = library.get(doc.id)
-        if doc.status in ("ready", "failed"):
+        if doc.status in ("ready", "failed") and not doc.later:  # pictures too
             await library.embedded()  # meaning search catches up in the background
             return doc
         await asyncio.sleep(0.01)
@@ -165,7 +174,7 @@ def test_text_files_images_and_spreadsheets(run, tmp_path):
         assert [p["location"] for p in library._parts(notes.id)] == ["lines 1-80", "lines 81-120"]
         assert (notes.done, notes.total) == (2, 2)
         buffer = tmp_path / "photo.png"
-        Image.new("RGB", (40, 40), "white").save(buffer)
+        scan(buffer, (40, 40))
         photo = await ready(library, "receipt.png", buffer.read_bytes())
         assert SCAN in library.read(photo.id, "page 1")["text"]
         frame = pd.DataFrame({"month": ["Jan"], "sales": [100]})
@@ -309,7 +318,7 @@ def test_the_agent_checks_its_answer_before_giving_it(run, tmp_path):
     run(body)
 
 
-def test_claude_vision_answers_are_split_per_page(tmp_path, monkeypatch):
+def test_claude_vision_sees_the_pictures_in_one_message(tmp_path, monkeypatch):
     import claude_agent_sdk
 
     from alfred.library import claude_vision
@@ -317,17 +326,20 @@ def test_claude_vision_answers_are_split_per_page(tmp_path, monkeypatch):
     asked = {}
 
     async def fake_query(prompt, options):
-        asked.update(prompt=prompt, tools=options.tools, model=options.model)
+        messages = [message async for message in prompt]
+        asked.update(content=messages[0]["message"]["content"], options=options)
         yield claude_agent_sdk.ResultMessage(
             subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=1,
-            session_id="s", result="=== page-1.png ===\nFirst page.\n=== page-2.png ===\nSecond.",
+            session_id="s", result="=== 1 ===\nFirst page.\n=== 2 ===\nSecond.",
         )  # fmt: skip
 
     monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
-    images = [tmp_path / "page-1.png", tmp_path / "page-2.png", tmp_path / "page-3.png"]
+    images = [scan(tmp_path / "1.png"), scan(tmp_path / "2.jpg"), scan(tmp_path / "3.png")]
     texts = asyncio.run(claude_vision("claude-haiku-5-5")(images))
     assert texts == ["First page.", "Second.", "[unclear]"]  # a page it skipped is unclear
-    assert asked["tools"] == ["Read"] and "page-3.png" in asked["prompt"]
+    kinds = [b["source"]["media_type"] for b in asked["content"] if b["type"] == "image"]
+    assert kinds == ["image/png", "image/jpeg", "image/png"]  # in the message, not as files
+    assert asked["options"].tools == [] and asked["options"].max_turns == 1  # one turn
 
 
 def test_the_library_list_reaches_the_prompts(run, tmp_path):
@@ -479,7 +491,7 @@ def test_small_files_are_read_first(tmp_path):
 
 def test_a_large_scan_waits_for_a_yes(tmp_path):
     async def main():
-        library = make(tmp_path, ask_pages=1)
+        library = make(tmp_path, ask_pages=1, daily_pages=1000)
         asked = []
         library.on_asking.append(asked.append)
         library.start()

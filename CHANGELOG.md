@@ -10,9 +10,14 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
   with the reason. A dropped folder keeps its folder names the same way.
 - **Pictures are read:** charts, diagrams and photos in Word and PowerPoint files
   (grouped ones too, each image once), large pictures on PDF pages, and Word's native
-  charts from the data inside them. Claude describes charts in full; the agent gets each
-  file and picture to look at itself. A file's text is searchable before its pictures are
-  read; pictures beyond the daily scan limit are noted on the file.
+  charts from the data inside them. Claude describes charts in full and diagrams as
+  outlines or arrows ("Order → Payment"); the agent gets each file and picture to look at
+  itself. A file's text is searchable before its pictures are read; pictures beyond the
+  daily scan limit are noted on the file.
+- **Diagrams are read:** a PowerPoint flowchart's joined shapes and SmartArt come straight
+  from the file; loose drawings are shown to Claude as the slide; PDF pages with drawn
+  diagrams are shown to Claude as the page.
+- **Markdown is split by its headings,** so a passage is cited by its section.
 - **Old Office files** (`.doc`, `.ppt`, `.rtf`, OpenDocument) are converted by LibreOffice
   and cited by their own name.
 - **Web facts are checked:** a citation may be a web page (HTML or PDF), read with the new
@@ -35,6 +40,19 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 - **He says what's broken:** OpenAI, Claude and the accounts are checked at start (in the
   background) and on "are you OK?"; a problem shows in the status bar and he says it
   once, in plain words, with the fix ("its sign-in was refused: run claude setup-token").
+- **Files arrive faster:** every file's text is read before any pictures (charts and photos
+  in Word and PowerPoint follow in a second pass), two files at a time, so a whole zip is
+  searchable in seconds. Pictures go to Claude inside the message, several a call
+  (`ALFRED_VISION_PER_CALL`, default 8) and several calls at once (`ALFRED_VISION_AT_ONCE`,
+  default 4), at the size Claude reads (1568 px): JPEG for photos and scans, PNG for
+  drawings. Blank pictures are skipped, and a picture repeated across files is read once.
+- **"The file I just sent":** files are listed newest first, with when each was added, and a
+  quick answer can search one file.
+- **A line on what each file is,** written by Claude behind the reading (ten files a call),
+  so "the lease" finds `scan_0041.pdf`.
+- **Room for a big library:** files up to 4 GB (Word and PowerPoint up to 2 GB), zips of
+  up to 50,000 files, and Claude reads up to 20,000 scanned pages and pictures a day,
+  asking first only past 10,000 in one file.
 - **Clear the library** on the library page. Library actions now need a header only that
   page sends, so another website can't clear, delete or upload.
 - **`./setup.sh`** installs everything Alfred needs, on the Pi or a Mac.
@@ -58,6 +76,7 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
   agent knows what its sandbox can't do, so it gives the address instead of testing
   around it and saving wrong lessons.
 - **No "[breath]" in the transcript:** sounds GPT-Live notes are left out.
+- Two files finishing together no longer fail saving their meaning vectors.
 - **"Go to sleep" is instant and reliable:** his "Goodnight, sir." now ends the
   conversation as soon as it has played; before, it needed a round trip through the
   delegate, which GPT-Live often skipped, so he stayed awake. The `sleep` tool is gone.

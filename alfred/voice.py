@@ -222,10 +222,11 @@ def background(services: Services) -> tuple[str, str]:
     Alfred knows about the user, the files in his library, recent tasks, projects and the
     apps page."""
     s = services
-    shared = s.config.context_text() + s.memory.prompt_text() + s.library.contents_text()
+    shared = s.config.context_text() + s.memory.prompt_text()
     projects = ", ".join(s.agent.projects.names()) or "none yet"
-    delegate = shared + f"\n\n## Projects\n{projects}"
+    delegate = shared + s.library.contents_text() + f"\n\n## Projects\n{projects}"
     delegate += not_set_up(s.music, s.google)
+    shared += s.library.contents_text(with_about=False)
     if s.web:
         delegate += s.web.address_text()
     return shared + recent_context(s.db), delegate + recent_context(s.db)

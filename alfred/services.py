@@ -13,7 +13,7 @@ from alfred.config import Config
 from alfred.db import Database
 from alfred.google import Google
 from alfred.health import Health
-from alfred.library import Library, Limits, claude_vision, openai_embedder
+from alfred.library import Library, Limits, claude_describer, claude_vision, openai_embedder
 from alfred.memory import Memory
 from alfred.music import Music
 from alfred.projects import Projects
@@ -55,9 +55,12 @@ class Services:
                 config.library_max_gb,
                 config.vision_ask_pages,
                 config.vision_daily_pages,
+                config.vision_per_call,
+                config.vision_at_once,
             ),
             openai_embedder(config.openai_api_key, config.embedding_model),
             config.embedding_model,
+            claude_describer(config.agent_model),
         )
         library.start()
         web = start_web(projects, apps, config.web_port, library)
