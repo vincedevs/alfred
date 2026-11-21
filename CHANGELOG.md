@@ -45,7 +45,9 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
   searchable in seconds. Pictures go to Claude inside the message, several a call
   (`ALFRED_VISION_PER_CALL`, default 8) and several calls at once (`ALFRED_VISION_AT_ONCE`,
   default 4), at the size Claude reads (1568 px): JPEG for photos and scans, PNG for
-  drawings. Blank pictures are skipped, and a picture repeated across files is read once.
+  drawings, see-through ones on white. Blank pictures are skipped, a picture repeated
+  across files is read once, and pictures Claude can't read just now (busy, a rate limit)
+  are tried again, then read a few minutes later rather than lost.
 - **"The file I just sent":** files are listed newest first, with when each was added, and a
   quick answer can search one file.
 - **A line on what each file is,** written by Claude behind the reading (ten files a call),

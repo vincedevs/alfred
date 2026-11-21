@@ -4,10 +4,12 @@ agent can answer questions about them with citations that are checked before he 
 Each file becomes text with locations a citation can point to: `page 12`, `slide 4`,
 `sheet Sales, rows 1-500`, `§ 14. Termination`, `lines 1-80`. PDF text comes straight from
 the file (pypdfium2), a page at a time; scanned pages and images are transcribed by Claude
-vision (marked scanned), after a yes for a large scan and within a daily page limit;
-spreadsheets are read row by row; Word, PowerPoint, EPUB and HTML go through MarkItDown,
-with the pictures in Word and PowerPoint files read by vision. Old Office formats are
-converted by LibreOffice first. A zip is unpacked into its files.
+vision (marked scanned), after a yes for a large scan and within a daily page limit, as
+are pages with drawn diagrams; spreadsheets are read row by row; Markdown by its headings;
+Word, PowerPoint, EPUB and HTML go through MarkItDown, with the pictures in Word and
+PowerPoint files read by vision, and a deck's diagrams read from the file itself (or by
+vision, for loose drawings). Old Office formats are converted by LibreOffice first. A zip
+is unpacked into its files.
 
 The text is cut into chunks labelled with their document and location, and found two ways
 (hybrid search): by keyword (SQLite FTS5, with stemming: "terminate" finds "termination")
@@ -87,6 +89,7 @@ EMBED_AT_ONCE = 64  # chunks per embeddings call
 FOUND_EACH_WAY = 40  # candidates from each search before the rankings are merged
 FUSION_K = 60  # reciprocal rank fusion: score = sum of 1 / (60 + rank)
 LISTED_IN_PROMPTS = 40  # more files than this: a summary instead of every name
+RETRY_SECONDS = 20  # a failed Claude call is tried once more after this
 RECHECK_SECONDS = 600  # paused files (daily scan limit) are looked at again this often
 
 SCHEMA = """
@@ -144,6 +147,11 @@ class Unreadable(Exception):
     """A file Alfred can't read. The message says why, for the library page."""
 
 
+class VisionFailed(Exception):
+    """Claude couldn't read some pictures just now (busy, or a rate limit): they're read
+    again later, not saved as unreadable."""
+
+
 @dataclass
 class Limits:
     max_mb: float = 4096  # per file
@@ -187,7 +195,7 @@ class Document:
 
     @property
     def media(self) -> Path:
-        """Where the pictures read from a Word or PowerPoint file go, as <part>.png."""
+        """Where the pictures read from a Word or PowerPoint file go, as <part>.jpg or .png."""
         return Path(self.path).with_name(f"{self.id}.media")
 
     def describe(self, with_file: bool = True) -> dict:
@@ -361,7 +369,7 @@ class Library:
         the user's yes on the library page"."""
         why = {"waiting": "still being read", "processing": "still being read",
                "asking": "waiting for the user's yes on the library page",
-               "paused": "waiting for tomorrow's scan limit"}  # fmt: skip
+               "paused": "paused, carrying on later (the scan limit, or Claude busy)"}  # fmt: skip
         counts: dict[str, int] = {}
         for doc in self.documents():
             if doc.status in why:
@@ -629,6 +637,8 @@ class Library:
                 if doc and doc.later and doc.status == "ready":
                     try:
                         await self._read_later(doc)
+                    except VisionFailed as error:  # read again when the queue is idle
+                        logger.warning(f"Library: {doc.name}'s pictures wait: {error}")
                     except Exception:  # its text stays searchable; only the pictures are lost
                         logger.exception(f"Library: couldn't read the pictures in {doc.name}")
                         self._set(doc.id, later=0, note="Its pictures couldn't be read.")
@@ -697,6 +707,8 @@ class Library:
         for doc in self.documents():
             if doc.status == "paused" and self.scans_left() > 0:
                 self._enqueue(doc.id)
+            elif doc.status == "ready" and doc.later and self.scans_left() > 0:
+                self._enqueue(doc.id, later=True)
 
     def _set(self, doc_id: str, **values) -> None:
         names = ", ".join(f"{key} = ?" for key in values)
@@ -716,15 +728,21 @@ class Library:
         self._clear(doc.id)
         self._set(doc.id, status="processing", done=0, note=None)
         if suffix in IMAGES:
-            if self.scans_left() < 1:
-                self._set(doc.id, status="paused", note=paused_note())
-                return False
-            self._count_scans(1)
+            async with self._scans:
+                if self.scans_left() < 1:
+                    self._set(doc.id, status="paused", note=paused_note())
+                    return False
+                self._count_scans(1)
             with tempfile.TemporaryDirectory() as folder:
                 image = await asyncio.to_thread(save_picture, path.read_bytes(), Path(folder) / "1")
                 if not image:
                     raise Unreadable("Alfred can't open this image.")
-                parts = [Part("page 1", (await self._see([image]))[0], scanned=True)]
+                try:
+                    parts = [Part("page 1", (await self._see([image]))[0], scanned=True)]
+                except VisionFailed:
+                    self._count_scans(-1)
+                    self._set(doc.id, status="paused", note=busy_note())
+                    return False
         elif suffix in MARKDOWN:
             markdown = await asyncio.to_thread(to_markdown, path)
             text = sections(markdown, suffix) + (word_charts(path) if suffix == ".docx" else [])
@@ -756,19 +774,20 @@ class Library:
     async def _read_later(self, doc: Document) -> None:
         """The second pass, once every file's text is in: a Word or PowerPoint file's
         pictures, and a deck's slides with loose drawings, as Claude sees them."""
-        path = Path(doc.readable)
-        parts = await self._pictures(doc, path, path.suffix.lower(), first=doc.total)
-        if path.suffix.lower() == ".pptx":
-            parts += await self._drawings(doc, path, first=doc.total + len(parts))
+        path, suffix = Path(doc.readable), Path(doc.readable).suffix.lower()
+        deck = await asyncio.to_thread(open_deck, path) if suffix == ".pptx" else None
+        parts = await self._pictures(doc, path, suffix, first=doc.total, deck=deck)
+        if deck:
+            parts += await self._drawings(doc, path, deck, first=doc.total + len(parts))
         if parts and self.get(doc.id):
             await self._store(doc, doc.total, parts)
             self._set(doc.id, total=doc.total + len(parts), done=doc.total + len(parts))
         self._set(doc.id, later=0)
 
-    async def _drawings(self, doc: Document, path: Path, first: int) -> list[Part]:
+    async def _drawings(self, doc: Document, path: Path, deck, first: int) -> list[Part]:
         """Slides whose drawings record no joins, drawn by LibreOffice (as a PDF, one page a
         slide) and read by Claude, within the daily scan limit."""
-        _, loose, slides = await asyncio.to_thread(slide_diagrams, path)
+        _, loose, slides = await asyncio.to_thread(slide_diagrams, deck)
         if not loose or not libreoffice():
             return []
         with tempfile.TemporaryDirectory() as folder:
@@ -786,16 +805,23 @@ class Library:
                 loose = loose[: max(self.scans_left(), 0)]
                 self._count_scans(len(loose))
             shown = await asyncio.to_thread(slide_pictures, pdf, loose, doc.media, first)
-        texts = await self._see([image for _, image in shown])
+        try:
+            texts = await self._see([image for _, image in shown])
+        except VisionFailed:
+            self._count_scans(-len(loose))
+            raise
         return [
             Part(f"slide {n}, drawing", text, True)
             for (n, _), text in zip(shown, texts, strict=True)
         ]
 
-    async def _pictures(self, doc: Document, path: Path, suffix: str, first: int) -> list[Part]:
+    async def _pictures(
+        self, doc: Document, path: Path, suffix: str, first: int, deck=None
+    ) -> list[Part]:
         """Charts, diagrams and photos in a Word or PowerPoint file, read by vision (within
-        the daily scan limit), each saved as <its part's number>.png for the agent to see."""
-        found = pictures_in(path, suffix) if self._vision and suffix in (".docx", ".pptx") else []
+        the daily scan limit), each saved as <its part's number>.jpg or .png for the agent."""
+        wanted = self._vision and suffix in (".docx", ".pptx")
+        found = await asyncio.to_thread(pictures_in, path, suffix, deck) if wanted else []
         kept: list[tuple[str, Path]] = []
         async with self._scans:
             if len(found) > (left := max(self.scans_left(), 0)):
@@ -811,7 +837,11 @@ class Library:
             self._count_scans(len(kept))
         if not kept:
             return []
-        texts = await self._see([png for _, png in kept])
+        try:
+            texts = await self._see([png for _, png in kept])
+        except VisionFailed:
+            self._count_scans(-len(kept))
+            raise
         return [Part(at, text, scanned=True) for (at, _), text in zip(kept, texts, strict=True)]
 
     def _clear(self, doc_id: str) -> None:
@@ -845,13 +875,19 @@ class Library:
         with tempfile.TemporaryDirectory(prefix="alfred-pages-") as folder:
             for start in range((self.get(doc.id) or doc).done, total, PAGES_AT_ONCE):
                 pages = await asyncio.to_thread(pdf_pages, path, start, PAGES_AT_ONCE, Path(folder))
-                pages, out_of_scans = within_budget(pages, self.scans_left())
-                images = [image for _, image in pages if image]
-                self._count_scans(len(images))
+                async with self._scans:
+                    pages, out_of_scans = within_budget(pages, max(self.scans_left(), 0))
+                    images = [image for _, image in pages if image]
+                    self._count_scans(len(images))
                 if not pages:
                     self._set(doc.id, status="paused", note=paused_note())
                     return False
-                seen = iter(await self._see(images)) if images else iter(())
+                try:
+                    seen = iter(await self._see(images)) if images else iter(())
+                except VisionFailed:  # this step again later; its scans aren't spent
+                    self._count_scans(-len(images))
+                    self._set(doc.id, status="paused", note=busy_note())
+                    return False
                 parts, pictures = [], []
                 for i, (text, image) in enumerate(pages):
                     at = f"page {start + i + 1}"
@@ -903,17 +939,27 @@ class Library:
 
         async def batch(group: list[int]) -> list[str]:
             async with slots:
-                read = await self._vision([images[i] for i in group])
+                try:
+                    read = await self._vision([images[i] for i in group])
+                except Exception as error:  # busy or a rate limit, often: once more
+                    logger.warning(f"Library: Claude couldn't read pictures ({error}); again")
+                    await asyncio.sleep(RETRY_SECONDS)
+                    read = await self._vision([images[i] for i in group])
             return (read + ["[unclear]"] * len(group))[: len(group)]
 
         groups = [todo[i : i + size] for i in range(0, len(todo), size)]
-        for group, read in zip(groups, await asyncio.gather(*map(batch, groups)), strict=True):
+        results = await asyncio.gather(*map(batch, groups), return_exceptions=True)
+        for group, read in zip(groups, results, strict=True):
+            if isinstance(read, BaseException):
+                continue
             for i, text in zip(group, read, strict=True):
                 texts[i] = text
                 if text != "[unclear]":
-                    self._seen[prints[i]] = text
+                    self._seen[prints[i]] = text  # kept even if another call failed
         while len(self._seen) > SEEN_AT_MOST:
             self._seen.pop(next(iter(self._seen)))
+        if failed := next((r for r in results if isinstance(r, BaseException)), None):
+            raise VisionFailed(str(failed)) from failed
         return texts
 
     async def _store(self, doc: Document, first: int, parts: list[Part]) -> None:
@@ -1174,6 +1220,10 @@ def paused_note() -> str:
     return "Today's limit for reading scanned pages is used up: it carries on tomorrow."
 
 
+def busy_note() -> str:
+    return "Claude couldn't read its pictures just now: it carries on in a few minutes."
+
+
 def within_budget(pages: list, scans_left: int) -> tuple[list, bool]:
     """The pages that fit today's scan budget, in order, and whether it ran out."""
     kept, scans = [], 0
@@ -1383,11 +1433,17 @@ def convert(path: Path, copy: Path, root: Path, to: str = "") -> None:
         shutil.move(made, copy)
 
 
-def pictures_in(path: Path, suffix: str) -> list[tuple[str, bytes]]:
-    """The pictures in a PowerPoint file, slide by slide ("slide 4, picture 2"), or in a
-    Word file ("picture 3"; small ones there are icons and bullets, left out)."""
+def open_deck(path: Path):
+    from pptx import Presentation
+
+    return Presentation(path)
+
+
+def pictures_in(path: Path, suffix: str, deck=None) -> list[tuple[str, bytes]]:
+    """The pictures in a PowerPoint file (`deck`, if it's open already), slide by slide
+    ("slide 4, picture 2"), or in a Word file ("picture 3"; small ones there are icons and
+    bullets, left out)."""
     if suffix == ".pptx":
-        from pptx import Presentation
         from pptx.enum.shapes import MSO_SHAPE_TYPE
 
         def walk(shapes):  # into groups; placeholders holding a picture have an image too
@@ -1397,7 +1453,7 @@ def pictures_in(path: Path, suffix: str) -> list[tuple[str, bytes]]:
                 elif image := getattr(shape, "image", None):
                     yield image.blob
 
-        slides = enumerate(Presentation(path).slides, start=1)
+        slides = enumerate((deck or open_deck(path)).slides, start=1)
         found = unique_blobs((n, blob) for n, slide in slides for blob in walk(slide.shapes))
         return [(f"slide {n}, picture {i}", blob) for i, (n, blob) in enumerate(found, start=1)]
     with zipfile.ZipFile(path) as word:
@@ -1424,21 +1480,19 @@ OOXML = {
 DRAWN_SHAPES = ("arrow", "Arrow", "flowChart", "chevron", "curved", "line")  # shapes, no joins
 
 
-def slide_diagrams(path: Path) -> tuple[list[Part], list[int], int]:
+def slide_diagrams(deck) -> tuple[list[Part], list[int], int]:
     """A deck's diagrams, read from the file itself: SmartArt as its outline, and boxes
     joined by arrows as "A → B" (PowerPoint records which shapes an arrow joins). Also
     the slides whose drawings record no joins (loose arrows, block arrows, freehand
     shapes), for Claude to look at instead, and how many slides there are. A slide whose
-    diagram can't be read is left to its text."""
-    from pptx import Presentation
-
-    slides = Presentation(path).slides
+    diagram can't be read is left to its text. `deck`: the file, or the deck opened."""
+    slides = (open_deck(deck) if isinstance(deck, Path) else deck).slides
     parts, loose = [], []
     for number, slide in enumerate(slides, start=1):
         try:
             found, unclear = diagrams_on(slide)
         except Exception:  # a diagram this doesn't understand: the slide's text still counts
-            logger.debug(f"Library: couldn't read the diagrams on slide {number} of {path.name}")
+            logger.debug(f"Library: couldn't read the diagrams on slide {number}")
             continue
         parts += [
             Part(f"slide {number}, diagram" + (f" {n}" if len(found) > 1 else ""), text)
@@ -1539,6 +1593,7 @@ def save_picture(picture, stem: Path) -> Path | None:
     try:
         image = picture if isinstance(picture, Image.Image) else Image.open(BytesIO(picture))
         width, height = image.size
+        see_through = image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info
         scale = min(
             1.0, CLAUDE_EDGE / max(width, height), (CLAUDE_PIXELS / (width * height)) ** 0.5
         )
@@ -1548,10 +1603,15 @@ def save_picture(picture, stem: Path) -> Path | None:
             isinstance(picture, bytes)
             and kind
             and scale == 1
+            and not see_through
             and not getattr(image, "is_animated", 0)
         ):
             (saved := stem.with_suffix(kind)).write_bytes(picture)
             return saved
+        if see_through:  # on white, as it's shown: else see-through turns black
+            shown = image.convert("RGBA")
+            image = Image.new("RGB", image.size, "white")
+            image.paste(shown, mask=shown.getchannel("A"))
         image = image.convert("RGB")
         if scale < 1:
             size = (max(1, int(width * scale + 1e-6)), max(1, int(height * scale + 1e-6)))
@@ -1894,6 +1954,8 @@ def claude_vision(model: str) -> Vision:
         answer = ""
         async for result in query(prompt=message(), options=options):
             if isinstance(result, ResultMessage):
+                if result.is_error:
+                    raise RuntimeError(result.result or "Claude returned an error")
                 answer = result.result or ""
         texts = {}
         for block in re.split(r"^=== ", answer, flags=re.MULTILINE)[1:]:

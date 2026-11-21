@@ -14,7 +14,7 @@ from openpyxl import Workbook
 from PIL import Image
 from pptx import Presentation
 from pptx.util import Inches
-from test_library import make, ready, run  # noqa: F401 (run is a fixture)
+from test_library import make, ready, run, scan  # noqa: F401 (run is a fixture)
 
 from alfred import library as library_module
 from alfred.library import Library, Limits, Refused
@@ -446,20 +446,105 @@ def test_the_newest_file_comes_first_and_can_be_searched_alone(run):  # noqa: F8
     run(body)
 
 
-def test_pictures_that_fail_lose_only_the_pictures(tmp_path):
+def test_pictures_claude_cant_read_now_wait_for_later(tmp_path, monkeypatch):
+    monkeypatch.setattr(library_module, "RETRY_SECONDS", 0)
+    calls = []
+
     async def vision(images):
+        calls.append(len(images))
         raise RuntimeError("Claude is down")
 
     async def main():
-        library = Library(tmp_path / "library", vision, Limits(max_mb=5))
+        library = Library(tmp_path / "library", vision, Limits(max_mb=5, daily_pages=50))
         library.start()
-        doc = await ready(library, "a.pptx", deck_with_picture(tmp_path, "Alpha sales"))
-        assert "couldn't be read" in library.get(doc.id).note
+        doc, _ = library.add("a.pptx", deck_with_picture(tmp_path, "Alpha sales"))
+        for _ in range(300):
+            if len(calls) == 2:
+                break
+            await asyncio.sleep(0.02)
+        assert len(calls) == 2  # tried once more
         after = await ready(library, "b.txt", b"Still reading files")  # the worker lives on
         assert after.status == "ready" and await library.search("alpha sales")
+        assert library.get(doc.id).later == 1 and library.scans_left() == 50  # not spent
         await library.stop()
 
     asyncio.run(main())
+
+
+def test_a_scan_claude_cant_read_now_pauses_then_carries_on(tmp_path, monkeypatch):
+    monkeypatch.setattr(library_module, "RETRY_SECONDS", 0)
+    down = [True]
+
+    async def vision(images):
+        if down[0]:
+            raise RuntimeError("rate limited")
+        return ["Invoice 7781"] * len(images)
+
+    async def main():
+        library = Library(tmp_path / "library", vision, Limits(max_mb=5, daily_pages=50))
+        library.start()
+        doc, _ = library.add("scan.png", scan(tmp_path / "s.png", (900, 600)).read_bytes())
+        for _ in range(200):
+            if library.get(doc.id).status == "paused":
+                break
+            await asyncio.sleep(0.02)
+        assert "couldn't read" in library.get(doc.id).note and library.scans_left() == 50
+        down[0] = False
+        await library._idle()
+        assert (await ready_doc(library, doc.id)).status == "ready"
+        assert await library.search("invoice 7781")
+        await library.stop()
+
+    asyncio.run(main())
+
+
+async def ready_doc(library, doc_id):
+    for _ in range(300):
+        if (doc := library.get(doc_id)).status in ("ready", "failed"):
+            return doc
+        await asyncio.sleep(0.02)
+    raise AssertionError(library.get(doc_id))
+
+
+def test_an_error_answer_from_claude_is_a_failure_not_unclear_pages(tmp_path, monkeypatch):
+    import claude_agent_sdk
+
+    from alfred.library import claude_vision
+
+    async def query(prompt, options):
+        yield claude_agent_sdk.ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=True, num_turns=1,
+            session_id="s", result="API Error: 429 rate limited",
+        )  # fmt: skip
+
+    monkeypatch.setattr(claude_agent_sdk, "query", query)
+    image = scan(tmp_path / "s.png", (300, 200))
+    with pytest.raises(RuntimeError, match="429"):
+        asyncio.run(claude_vision("claude-haiku-5-5")([image]))
+
+
+def test_the_daily_limit_holds_even_when_overspent():
+    from alfred.library import within_budget
+
+    pages = [("", Path(f"{n}.png")) for n in range(3)]
+    assert within_budget(pages, 0) == ([], True)  # what scans_left can't go below
+
+
+def test_a_see_through_drawing_is_put_on_white(tmp_path):
+    from PIL import Image, ImageDraw
+
+    from alfred.library import blank, save_picture
+
+    for size in ((3000, 2000), (800, 600)):  # shrunk, and kept at its size
+        drawing = Image.new("RGBA", size, (0, 0, 0, 0))
+        ImageDraw.Draw(drawing).rectangle(
+            [50, 50, size[0] - 50, size[1] - 50], outline="black", width=12
+        )
+        out = io.BytesIO()
+        drawing.save(out, "PNG")
+        saved = save_picture(out.getvalue(), tmp_path / f"{size[0]}")
+        assert Image.open(saved).convert("RGB").getpixel((5, 5)) == (255, 255, 255)
+        assert not blank(saved)
 
 
 def test_only_the_backend_gets_what_each_file_is(run):  # noqa: F811
