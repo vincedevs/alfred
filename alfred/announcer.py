@@ -14,6 +14,7 @@ from pipecat.services.openai.live import events as live_events
 
 from alfred.agent import Agent
 from alfred.db import Database, Question, Reminder, Task
+from alfred.health import Health
 from alfred.library import Library
 from alfred.questions import Questions
 from alfred.reminders import Reminders
@@ -35,7 +36,9 @@ class Announcer:
         reminders: Reminders,
         ring: Callable[[list[Reminder]], None] = lambda _due: None,
         library: Library | None = None,
+        health: Health | None = None,
     ):
+        self._health = health
         self._llm, self._db, self._agent, self._questions = llm, db, agent, questions
         self._reminders, self._ring, self._library = reminders, ring, library
         self._has_files = bool(library and library.documents())
@@ -49,6 +52,8 @@ class Announcer:
         self._watching = asyncio.create_task(self._watch_reminders())
         if self._library:
             self._library.on_change.append(self._library_changed)
+        if self._health:
+            self._health.on_problem.append(self._problem)
 
     def stop(self) -> None:
         self._agent.on_finished.remove(self._finished)
@@ -57,6 +62,13 @@ class Announcer:
             self._watching.cancel()
         if self._library:
             self._library.on_change.remove(self._library_changed)
+        if self._health:
+            self._health.on_problem.remove(self._problem)
+
+    def _problem(self, service: str) -> None:
+        """Something broke while you talk: he says so now (else at the next conversation)."""
+        if self.session_open and not self.closing:
+            self.tell(f"{self._health.note(service)} {RULES}")
 
     def _library_changed(self) -> None:
         """Files arrived in an empty library: GPT-Live is told quietly, as its instructions
@@ -126,16 +138,17 @@ def recent_context(db: Database) -> str:
 
 
 def opening_messages(
-    db: Database, questions: Questions, reminders: Reminders
+    db: Database, questions: Questions, reminders: Reminders, health: Health | None = None
 ) -> tuple[list[dict], list[int], list[int]]:
-    """If reminders are due, or tasks finished or asked something since the last
-    conversation, Alfred opens with that. Also returns the tasks to mark as told and the
+    """If reminders are due, tasks finished or asked something since the last conversation,
+    or something broke, Alfred opens with that. Also returns the tasks to mark as told and the
     reminders to mark as said once the session has opened."""
     untold = db.untold_results()
     finished = [t for t in untold if t.status in ("done", "failed")]
     waiting = questions.waiting()
     due = reminders.due()
-    if not finished and not waiting and not due:
+    broken = health.untold() if health else []
+    if not finished and not waiting and not due and not broken:
         return [], [t.id for t in untold], []
     logger.info(
         f"Opening with {len(due)} reminder(s), {len(finished)} finished task(s), "
@@ -148,6 +161,7 @@ def opening_messages(
     parts += [
         f"- Task {q.task_id} asks (pass the answer on with answer_task): {q.text}" for q in waiting
     ]
+    parts += broken
     parts.append(RULES)
     messages = [{"role": "developer", "content": "\n".join(parts)}]
     return messages, [t.id for t in untold], [r.id for r in due]

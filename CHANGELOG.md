@@ -26,6 +26,15 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 - **A terminal to watch:** the conversation as chat bubbles, each answer's steps and checked
   quotes, a status bar, and the library page's address. `uv run alfred --plain` shows
   the plain log; the full log still goes to `logs/`.
+- **Music:** Spotify by voice (play a song, artist, album or playlist; pause, skip,
+  volume, what's playing), turned down while he's awake so he hears you.
+- **Calendar and email, read-only:** what's on your Google calendars, and finding and
+  reading Gmail.
+- **Connecting accounts:** `uv run alfred-connect spotify` (or `google`) logs in once, also
+  on a Pi with no screen; Alfred renews the login himself.
+- **He says what's broken:** OpenAI, Claude and the accounts are checked at start (in the
+  background) and on "are you OK?"; a problem shows in the status bar and he says it
+  once, in plain words, with the fix ("its sign-in was refused: run claude setup-token").
 - **Clear the library** on the library page. Library actions now need a header only that
   page sends, so another website can't clear, delete or upload.
 - **`./setup.sh`** installs everything Alfred needs, on the Pi or a Mac.
@@ -42,6 +51,13 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
   `cp skills/answering-from-documents/SKILL.md ~/.alfred/skills/skills/answering-from-documents/`
 
 ### Fixed
+- **Building things works smoothly by voice:** approval questions are plain words ("May I
+  delete files, to start a fresh git history?") with the exact command on screen, not a
+  command read out symbol by symbol; a "yes" to a task's question always reaches the
+  task; something new to build gets its own project, so it's on the apps page; and the
+  agent knows what its sandbox can't do, so it gives the address instead of testing
+  around it and saving wrong lessons.
+- **No "[breath]" in the transcript:** sounds GPT-Live notes are left out.
 - **"Go to sleep" is instant and reliable:** his "Goodnight, sir." now ends the
   conversation as soon as it has played; before, it needed a round trip through the
   delegate, which GPT-Live often skipped, so he stayed awake. The `sleep` tool is gone.

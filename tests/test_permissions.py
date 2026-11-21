@@ -96,10 +96,12 @@ def test_asking_waits_for_a_spoken_yes_and_logs_it(places, tmp_path):
         audit = tmp_path / "audit.jsonl"
         guard = Guard(questions, AuditLog(audit), places[1], ZoneInfo("UTC"))
         check = asyncio.create_task(
-            guard.check(7, places[0], "Bash", {"command": "git push origin main"})
+            guard.check(
+                7, places[0], "Bash", {"command": "git push origin main", "description": "Ship it."}
+            )
         )
-        await asyncio.sleep(0.01)
-        assert questions.waiting()[0].text == "May I run: git push origin main?"
+        await asyncio.sleep(0.01)  # in plain words: what kind (decided here) and what for
+        assert questions.waiting()[0].text == "May I push to GitHub, to ship it?"
         questions.answer(7, "yes")
         assert (await check)[0] is True
 
@@ -133,7 +135,7 @@ def test_always_allows_that_kind_in_that_project_today(places, tmp_path):
             guard.check(8, places[0], "Bash", {"command": "git push --force origin main"})
         )
         await asyncio.sleep(0.01)
-        assert "--force" in questions.waiting()[0].text  # a kind of its own: still asked
+        assert "force-push" in questions.waiting()[0].text  # a kind of its own: still asked
         questions.answer(8, "no")
         assert (await force)[0] is False
         other = asyncio.create_task(guard.check(9, tmp_path, "Bash", push))
@@ -160,7 +162,7 @@ def test_kinds_of_action():
 
 def test_starting_an_app_is_asked_first(places):
     decision = decide("mcp__alfred__serve_app", {"command": "npm run dev", "port": 0}, *places)
-    assert decision.action == "ask" and "npm run dev" in decision.reason
+    assert decision.action == "ask" and decision.detail == "npm run dev"  # shown on screen
     assert decision.kind == "app"  # "always" works for it
 
 

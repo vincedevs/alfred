@@ -41,12 +41,17 @@ async def run(config: Config) -> None:
     engine.start()
     services = Services.start(config)
     show_library(services.library)
-    claude = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
-    checks = {"mic": True, "OpenAI": bool(config.openai_api_key), "Claude": bool(claude)}
-    display.card(version("alfred"), checks, services.web.ip_address if services.web else None)
+    display.card(version("alfred"), services.web.ip_address if services.web else None)
     services.agent.on_finished.append(lambda _task: engine.play(done))
     handle_shutdown_signals(services.agent)
     background: set[asyncio.Task] = set()
+
+    def in_background(job) -> None:
+        task = asyncio.create_task(job)
+        background.add(task)
+        task.add_done_callback(background.discard)
+
+    in_background(services.health.check())  # what's broken shows, and is said, without delay
     try:
         while True:
             logger.info('Waiting for "Hey Alfred"...')
@@ -63,15 +68,17 @@ async def run(config: Config) -> None:
                     woken = await ring(engine, detector, ringing)
             engine.play(wake if woken else done)
             display.status(mode="Listening")
+            if services.music:
+                in_background(services.music.alfred_awake())
             transcript = await run_conversation(engine, services, woken)
+            if services.music:
+                in_background(services.music.alfred_asleep())
             if asyncio.current_task().cancelling():  # Pipecat swallows Ctrl+C: pass it on
                 raise asyncio.CancelledError
             if transcript is None:
                 engine.play(offline)  # two low beeps: couldn't reach OpenAI
             else:
-                learning = asyncio.create_task(services.memory.learn(transcript))
-                background.add(learning)
-                learning.add_done_callback(background.discard)
+                in_background(services.memory.learn(transcript))
             detector.reset()
             engine.clear_mic()  # the end of the conversation mustn't wake him again
     finally:

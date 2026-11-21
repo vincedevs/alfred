@@ -1,5 +1,6 @@
 """The tools GPT-Live's delegate calls (besides web search): hand work to the agent, check
-and answer it, memory, reminders, apps and skills.
+and answer it, memory, reminders, apps, skills, a self-check, and (once connected) music,
+calendar and email.
 
 Each tool is a plain async function: Pipecat reads its name, docstring and arguments to
 describe it to the model, and runs it here when the model calls it.
@@ -7,14 +8,18 @@ describe it to the model, and runs it here when the model calls it.
 
 import time
 
+import httpx
 from pipecat.services.llm_service import FunctionCallParams
 
 from alfred import display
 from alfred.agent import Agent, check_answer
 from alfred.apps import Apps
 from alfred.db import Database, Task
+from alfred.google import Google, GoogleError
+from alfred.health import Health
 from alfred.library import Library
 from alfred.memory import Memory
+from alfred.music import Music, MusicError
 from alfred.questions import Questions
 from alfred.reminders import Reminders
 
@@ -29,6 +34,9 @@ def delegate_tools(
     reminders: Reminders,
     apps: Apps,
     library: Library | None = None,
+    health: Health | None = None,
+    music: Music | None = None,
+    google: Google | None = None,
 ) -> list:
     async def do_task(params: FunctionCallParams, request: str, project: str = ""):
         """Hand work to the agent: anything beyond a quick web search. It can read, write
@@ -38,8 +46,9 @@ def delegate_tools(
         Args:
             request: The task in full: the user's goal, every detail they gave, their latest
                 correction. For a follow-up, say what it follows on from.
-            project: The project it belongs to, as the user named it ("portfolio"). Empty
-                for anything not about a project.
+            project: The project it belongs to, as the user named it ("portfolio"). For
+                something new to build (a game, a site, an app), a short name for it
+                ("flappy bird"): it gets its own project. Empty for anything else.
         """
         name = agent.projects.resolve(project)
         display.step("🧠", "handed to Claude", route="by Claude")
@@ -238,13 +247,100 @@ def delegate_tools(
         """
         await params.result_callback({"forgotten": agent.skills.remove(name)})
 
+    async def self_check(params: FunctionCallParams):
+        """Check that everything Alfred needs works (OpenAI, Claude, and music, calendar and
+        email if set up), when the user asks if he's OK or what's wrong. Takes seconds.
+        Not for how tasks are going: task_status."""
+        display.step("🩺", "checking everything")
+        result = await health.check(tell=False) if health else {}
+        docs = library.documents() if library else []
+        ready = sum(d.status == "ready" for d in docs)
+        await params.result_callback(
+            result
+            | {"tasks running": len(db.running_tasks()), "files": f"{ready} of {len(docs)} ready"}
+        )
+
+    async def play_music(
+        params: FunctionCallParams,
+        action: str,
+        query: str = "",
+        kind: str = "song",
+        volume: int = 0,
+    ):
+        """Spotify: play, pause, skip, go back, set the volume, or say what's playing.
+
+        Args:
+            action: play, pause, skip, back, volume or now_playing.
+            query: For play: what to play, in the user's words ("Bohemian Rhapsody",
+                "lo-fi beats"). Empty: carry on where it stopped.
+            kind: For play: song, artist, album or playlist; a mood or genre is a playlist.
+            volume: For volume: 0 to 100.
+        """
+        actions = {
+            "play": lambda: music.play(query, kind),
+            "pause": music.pause,
+            "skip": music.skip,
+            "back": lambda: music.skip(back=True),
+            "volume": lambda: music.volume(volume),
+            "now_playing": music.now_playing,
+        }
+        display.step("🎵", f"{action} {query}".strip())
+        await params.result_callback(await account_call(actions.get(action), "Spotify"))
+
+    async def calendar(params: FunctionCallParams, start: str = "", days: int = 1):
+        """What's on the user's Google calendars.
+
+        Args:
+            start: The first day, as YYYY-MM-DD; empty for today.
+            days: How many days: 1 for that day, 7 for a week.
+        """
+        display.step("📅", "checked your calendar")
+        result = await account_call(lambda: google.events(start, days), "Google")
+        await params.result_callback(result if "error" in result else {"events": result})
+
+    async def find_emails(
+        params: FunctionCallParams, search: str = "is:unread in:inbox", limit: int = 5
+    ):
+        """The user's Gmail, read-only: emails matching a Gmail search, newest first, each
+        with an id for read_email.
+
+        Args:
+            search: A Gmail search: "is:unread in:inbox" (new mail), "from:maria",
+                "subject:invoice newer_than:7d".
+            limit: How many, at most 10.
+        """
+        display.step("✉", f"searched your email: {search}")
+        result = await account_call(lambda: google.emails(search, limit), "Google")
+        await params.result_callback(result if "error" in result else {"emails": result})
+
+    async def read_email(params: FunctionCallParams, email_id: str):
+        """One email's text, by the id find_emails gave.
+
+        Args:
+            email_id: The email's id.
+        """
+        await params.result_callback(await account_call(lambda: google.email(email_id), "Google"))
+
     return [
         do_task, task_status, answer_task, stop_task,
         remember, recall, forget, remind, list_reminders, cancel_reminder,
         list_apps, stop_app, restart_app, list_documents, search_files, check_answer_from_files,
         read_large_scan,
-        list_skills, forget_skill,
+        list_skills, forget_skill, self_check,
+        *([play_music] if music else []), *([calendar, find_emails, read_email] if google else []),
     ]  # fmt: skip
+
+
+async def account_call(call, service: str):
+    """Run a music, calendar or email call; its problem, in words, if it fails."""
+    if call is None:
+        return {"error": "Unknown action."}
+    try:
+        return await call()
+    except (MusicError, GoogleError, ValueError) as error:
+        return {"error": str(error)}
+    except httpx.HTTPError:
+        return {"error": f"I couldn't reach {service}."}
 
 
 def describe(task: Task) -> dict:

@@ -8,7 +8,9 @@ nothing the agent reads (a web page, a README) can change them.
     never   secrets outside the project (keys, SSH, Alfred's own settings), sudo,
             leaving the sandbox
 
-"Ask" pauses the task until you answer out loud; anything but a clear yes is a no.
+"Ask" pauses the task until you answer out loud; anything but a clear yes is a no. The
+question is in plain words: what kind of action it is (decided here, not by the agent),
+and what for (the agent's own description); the exact command is shown on screen.
 "Always" is a yes for that kind of action (pushing, say) in that project until midnight,
 or until Alfred restarts. Force-pushing is a kind of its own. Every decision goes to the
 audit log. Shell commands also run in the operating system's
@@ -23,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger
 
+from alfred import display
 from alfred.audit import AuditLog
 from alfred.config import PROJECT_ROOT
 from alfred.questions import Questions, is_always, is_yes
@@ -62,6 +65,17 @@ ASK = [  # (kind, pattern): the first match names the kind, for "always" answers
     ("run-download", r"\b(curl|wget)\b[^|]*\|\s*(ba|z)?sh\b"),
 ]
 ASK = [(kind, re.compile(pattern, re.IGNORECASE)) for kind, pattern in ASK]
+SAID = {  # each kind, as Alfred asks about it
+    "force-push": "force-push, overwriting history on GitHub",
+    "push": "push to GitHub",
+    "undo": "throw away changes in git",
+    "github": "change something on GitHub",
+    "delete": "delete files",
+    "install": "install system software",
+    "publish": "publish a package",
+    "send": "send data to a website",
+    "run-download": "run a script straight from the web",
+}
 
 
 @dataclass(frozen=True)
@@ -69,6 +83,7 @@ class Decision:
     action: str  # allow | ask | deny
     reason: str  # deny: why; ask: the action, in words Alfred reads out
     kind: str = ""  # ask: what an "always" answer covers (push, delete, skill...)
+    detail: str = ""  # ask: the exact command, shown on screen
 
 
 def decide(
@@ -81,7 +96,9 @@ def decide(
     if tool == "Bash":
         return _decide_command(tool_input)
     if tool == "mcp__alfred__serve_app":  # runs outside the sandbox
-        return Decision("ask", f"start your app with: {tool_input.get('command', '')[:200]}", "app")
+        return Decision(
+            "ask", "start the app so you can try it", "app", tool_input.get("command", "")
+        )
     return Decision("ask", f"use {tool} with {str(tool_input)[:150]}", f"tool {tool}")
 
 
@@ -118,7 +135,9 @@ def _decide_command(tool_input: dict) -> Decision:
         return Decision("deny", "that touches secrets or needs admin rights")
     for kind, pattern in ASK:
         if pattern.search(command):
-            return Decision("ask", f"run: {command[:200]}", kind)
+            why = (tool_input.get("description") or "").strip().rstrip(".")[:120]
+            said = SAID[kind] + (f", to {why[:1].lower()}{why[1:]}" if why else "")
+            return Decision("ask", said, kind, command)
     return Decision("allow", "a sandboxed command")
 
 
@@ -182,6 +201,8 @@ class Guard:
             return True, "approved (standing)"
         if (task_id, decision.reason) in self._declined:
             return False, "declined before"
+        if decision.detail:
+            display.step("❓", decision.detail[:300])
         answer = await self._questions.ask(task_id, "approve", f"May I {decision.reason}?")
         if is_always(answer):
             self._always[standing] = today

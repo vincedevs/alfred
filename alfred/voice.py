@@ -77,7 +77,7 @@ class Conversation:
         self._user_spoke = asyncio.Event()
         self._looked_up_at = -1e9
         self.llm = create_gpt_live(s.config, *background(s))
-        opening, self._told, self._said = opening_messages(s.db, s.questions, s.reminders)
+        opening, self._told, self._said = opening_messages(s.db, s.questions, s.reminders, s.health)
         self._has_news = bool(opening)
         tools = delegate_tools(
             s.agent,
@@ -87,6 +87,9 @@ class Conversation:
             s.reminders,
             s.apps,
             library=s.library,
+            health=s.health,
+            music=s.music,
+            google=s.google,
         )
         context = LLMContext(
             messages=opening,
@@ -109,7 +112,14 @@ class Conversation:
             s.config,
         )
         self.announcer = Announcer(
-            self.llm, s.db, s.agent, s.questions, s.reminders, ring=self._ring, library=s.library
+            self.llm,
+            s.db,
+            s.agent,
+            s.questions,
+            s.reminders,
+            ring=self._ring,
+            library=s.library,
+            health=s.health,
         )
         self._rings = {
             k: load_sound(PROJECT_ROOT / "sounds" / f"{f}.wav") for k, f in RINGS.items()
@@ -298,13 +308,20 @@ def log_conversation(llm, user_turns, alfred_turns, on_line, on_delegation=None)
 
     @user_turns.event_handler("on_user_turn_message_added")
     async def on_user_turn(_aggregator, message):
-        logger.info(f"You: {message.content}")
-        display.said("You", str(message.content))
-        on_line("You", str(message.content))
+        if text := spoken(message.content):
+            logger.info(f"You: {text}")
+            display.said("You", text)
+            on_line("You", text)
 
     @alfred_turns.event_handler("on_assistant_turn_stopped")
     async def on_alfred_turn(_aggregator, message):
-        if message.content:
-            logger.info(f"Alfred: {message.content}")
-            display.said("Alfred", str(message.content))
-        on_line("Alfred", str(message.content or ""))
+        text = spoken(message.content)
+        if text:
+            logger.info(f"Alfred: {text}")
+            display.said("Alfred", text)
+        on_line("Alfred", text)
+
+
+def spoken(content) -> str:
+    """The words of a turn, without the sounds GPT-Live notes: "[breath]", "[laughs]"."""
+    return " ".join(re.sub(r"\[[^\]]*\]", " ", str(content or "")).split())

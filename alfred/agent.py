@@ -40,6 +40,7 @@ from alfred.apps import Apps
 from alfred.audit import AuditLog
 from alfred.config import PROJECT_ROOT, Config, load_prompt
 from alfred.db import Database, Task
+from alfred.health import Health, claude_problem
 from alfred.library import Library, answer_page
 from alfred.memory import Memory
 from alfred.permissions import Guard
@@ -85,7 +86,9 @@ class Agent:
         memory: Memory | None = None,
         apps: Apps | None = None,
         library: Library | None = None,
+        health: Health | None = None,
     ):
+        self._health = health
         self._db, self._config, self._questions, self._audit = db, config, questions, audit
         self.projects, self.skills = projects, skills
         self._about_user, self._memory, self._apps = about_user, memory, apps
@@ -164,6 +167,8 @@ class Agent:
             async with lock, self._slots:
                 result = await self._run_agent(task_id, project, request, resuming)
             status = "done"
+            if self._health:
+                self._health.ok("Claude")
         except asyncio.CancelledError:
             if self._closing:
                 raise
@@ -173,6 +178,8 @@ class Agent:
                 return
             logger.exception(f"Task {task_id} failed")
             status, result = "failed", f"{type(error).__name__}: {error}"
+            if self._health and (problem := claude_problem(str(error))):
+                self._health.failed("Claude", problem)
         finally:
             self._tasks.pop(task_id, None)
             display.status(tasks=len(self._tasks))

@@ -21,6 +21,7 @@ from loguru import logger
 
 from alfred.config import Config, ConfigError, load_config, load_prompt
 from alfred.db import Database, Fact
+from alfred.health import Health, claude_problem
 
 FACTS_IN_PROMPTS = 30  # newest facts every prompt gets; recall finds the older ones
 LESSONS_IN_PROMPTS = 20  # newest lessons for the project the agent works in
@@ -38,8 +39,8 @@ def words_in(text: str) -> list[str]:
 
 
 class Memory:
-    def __init__(self, db: Database, config: Config):
-        self._db, self._config = db, config
+    def __init__(self, db: Database, config: Config, health: Health | None = None):
+        self._db, self._config, self._health = db, config, health
 
     def facts(self) -> list[Fact]:
         return self._db.facts()
@@ -107,7 +108,11 @@ class Memory:
             notes = await self._ask("\n".join(transcript)[-12000:])
         except Exception as error:  # memory is a nice-to-have: never break Alfred over it
             logger.warning(f"Couldn't learn from the conversation: {error}")
+            if self._health and (problem := claude_problem(str(error))):
+                self._health.failed("Claude", problem)
             return
+        if self._health:
+            self._health.ok("Claude")
         for fact in notes.get("new_facts", []):
             self.remember(str(fact), source="learned")
         if summary := str(notes.get("summary", "")).strip():

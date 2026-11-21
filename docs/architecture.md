@@ -24,6 +24,8 @@ mic ─► wake word ─► GPT-Live (voice) ─► delegate ─► tools ─►
 | Running | `__main__`, `services`, `config`, `logs`, `lock`, `reset` | Start-up, settings, logs |
 | Library | `library`, `webcheck`, `web` | Uploaded files and zips (in resumable pieces) read into located text (Claude vision for scans and pictures, within limits; LibreOffice for old Office files), hybrid keyword and meaning search, the agent's search, read and citation-check tools, quotes checked against files and web pages |
 | Apps | `apps`, `web` | Running the apps Alfred builds; the apps page listing them, with static sites and pages |
+| Accounts | `accounts`, `music`, `google` | Logins (OAuth, by hand); Spotify control, turned down while he's awake; Google calendar and Gmail, read-only |
+| Health | `health`, `display` | Checking OpenAI, Claude and the accounts; problems in the status bar and said once; the terminal view |
 
 ## A request, end to end
 

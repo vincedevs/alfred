@@ -14,7 +14,7 @@ from rich.text import Text
 console = Console(highlight=False)
 on = False  # main() turns it on unless --plain
 _live: Live | None = None
-_state = {"mode": "Starting", "files": "no files", "tasks": 0, "cost": 0.0}
+_state = {"mode": "Starting", "files": "no files", "tasks": 0, "cost": 0.0, "problems": ""}
 _asked = {"at": 0.0, "route": ""}
 _reply = {"text": "", "note": ""}  # Alfred's reply so far: live until something else prints
 COLOURS = {"Listening": "green", "Thinking": "yellow", "Speaking": "cyan"}
@@ -51,6 +51,7 @@ def _bar() -> Text:
         ("● ", COLOURS.get(mode, "dim")), (f"{mode:<14}", "bold"),
         (f"library: {_state['files']}   tasks: {_state['tasks']}   "
          f"${_state['cost']:.2f} this session", "dim"),
+        (f"   ⚠ not working: {_state['problems']}" if _state["problems"] else "", "bold red"),
     )  # fmt: skip
 
 
@@ -79,14 +80,11 @@ def _print(thing) -> None:
     status()
 
 
-def card(version: str, checks: dict[str, bool], address: str | None) -> None:
-    """At start: what's running, and where to drop files."""
+def card(version: str, address: str | None) -> None:
+    """At start: the version, and where to drop files."""
     if not on:
         return
-    ticks = "  ".join(
-        f"{name} {'[green]✓[/]' if ok else '[red]✗[/]'}" for name, ok in checks.items()
-    )
-    about = f"[bold]▶◀  Alfred {version}[/]      {ticks}"
+    about = f"[bold]▶◀  Alfred {version}[/]"
     if address:
         about += f"\nDrop files at [link={address}library]{address}library[/link]"
     _print(Panel(about, border_style="yellow", expand=False))

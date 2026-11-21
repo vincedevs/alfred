@@ -10,7 +10,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SECRET_SETTINGS = ("openai_api_key", "github_token")  # never logged or printed
+SECRET_SETTINGS = (
+    "openai_api_key",
+    "github_token",
+    "google_client_secret",
+)  # never logged or printed
 
 
 class ConfigError(Exception):
@@ -43,6 +47,10 @@ class Config:
     home: str = "Manila, Philippines"
     timezone: str = "Asia/Manila"  # a new Raspberry Pi starts on UTC
     web_port: int | None = None  # the apps page on the home network; None: off
+    spotify_client_id: str = ""  # music (music.py); empty: off
+    spotify_speaker: str = ""  # the Spotify speaker to play on; empty: the one playing
+    google_client_id: str = ""  # calendar and email (google.py); empty: off
+    google_client_secret: str = field(default="", repr=False)
 
     @property
     def database_path(self) -> Path:
@@ -121,6 +129,10 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         home=env.get("ALFRED_HOME") or d.home,
         timezone=_timezone(env.get("ALFRED_TIMEZONE") or d.timezone),
         web_port=_port(env.get("ALFRED_WEB_PORT")),
+        spotify_client_id=(env.get("SPOTIFY_CLIENT_ID") or "").strip(),
+        spotify_speaker=(env.get("SPOTIFY_SPEAKER") or "").strip(),
+        google_client_id=(env.get("GOOGLE_CLIENT_ID") or "").strip(),
+        google_client_secret=(env.get("GOOGLE_CLIENT_SECRET") or "").strip(),
     )
 
 

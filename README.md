@@ -24,6 +24,10 @@ saves it (after asking) and uses it next time.
 - Drop files, a folder or a zip at `http://<pi>:8080/library`, then: "What's the notice period in my lease?"
   "What were total sales in March?" He answers with the page, and puts the full answer,
   with quotes, on the apps page. Every quote is checked against the file first.
+- "Play some lo-fi." "Skip this." "Louder." "What's playing?" (Spotify, once connected)
+- "What's on my calendar tomorrow?" "Any new email from Maria?" "Read it to me." (Google,
+  once connected; he only reads)
+- "Are you OK?" He checks OpenAI, Claude and your accounts, and says what's wrong.
 - "How's it going?" "Stop that." "Go to sleep."
 
 How it works: [docs/architecture.md](docs/architecture.md).
@@ -66,6 +70,24 @@ packages, the agent's sandbox (`bubblewrap`, `socat`; built into macOS), `git` a
 GitHub CLI, PortAudio, and LibreOffice for old Office files (`--no-office` skips it). It
 makes `.env` from `.env.example` and says which keys are missing. `--service` (Linux)
 starts Alfred at boot. On a Mac, allow microphone access for your terminal when asked.
+
+### Music, calendar and email (optional)
+
+Each login is done once, with `uv run alfred-connect spotify` or `google`: open the link it
+prints on any device, approve, and paste back the address the browser lands on (that page
+won't load; that's expected, so this works on a Pi with no screen). Alfred keeps the login
+and renews it himself: there's nothing to run again.
+
+- **Spotify** (needs Premium): create an app at developer.spotify.com, add the redirect URI
+  `http://127.0.0.1:8765/callback`, and put its Client ID in `SPOTIFY_CLIENT_ID`. Music
+  plays on a Spotify speaker: the Spotify app on a computer or phone, or the Pi itself
+  with [Raspotify](https://github.com/dtcooper/raspotify) (name it in `SPOTIFY_SPEAKER`).
+  While Alfred is awake the music is turned down, so he hears you.
+- **Google** (read-only): in Google Cloud, turn on the Calendar and Gmail APIs, make an
+  OAuth client of type "Desktop app", add yourself as a test user, and put its ID and
+  secret in `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`. Then set the app's publishing
+  status to "In production" (no review is needed for your own account): while it says
+  "Testing", Google ends the login every 7 days.
 
 ## Run
 
