@@ -41,7 +41,7 @@ from alfred.audio import SAMPLE_RATE, AudioEngine, load_sound
 from alfred.config import PROJECT_ROOT, Config, load_prompt
 from alfred.idle import QuietTimer, check_every
 from alfred.services import Services
-from alfred.tools import delegate_tools
+from alfred.tools import delegate_tools, not_set_up
 from alfred.transport import EngineTransport
 
 LOGGED_FRAMES = (  # worth a line in the debug log
@@ -225,6 +225,7 @@ def background(services: Services) -> tuple[str, str]:
     shared = s.config.context_text() + s.memory.prompt_text() + s.library.contents_text()
     projects = ", ".join(s.agent.projects.names()) or "none yet"
     delegate = shared + f"\n\n## Projects\n{projects}"
+    delegate += not_set_up(s.music, s.google)
     if s.web:
         delegate += s.web.address_text()
     return shared + recent_context(s.db), delegate + recent_context(s.db)

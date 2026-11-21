@@ -42,6 +42,8 @@ def delegate_tools(
         """Hand work to the agent: anything beyond a quick web search. It can read, write
         and run code, use git and GitHub, research, make files and pages, and learn skills.
         Quick tasks return the answer; longer ones keep running and are announced when done.
+        Not for reminders, memory, apps, skills, music, calendar or email: their own tools
+        are much faster.
 
         Args:
             request: The task in full: the user's goal, every detail they gave, their latest
@@ -67,7 +69,8 @@ def delegate_tools(
             await params.result_callback(describe(task))
 
     async def task_status(params: FunctionCallParams, task_id: int = 0):
-        """How the agent's tasks are going, their results, and questions they're waiting on.
+        """How the agent's tasks are going ("how's it going?"), their results, and questions
+        they're waiting on. Not for running apps: list_apps.
 
         Args:
             task_id: The task to check, or 0 for the most recent ones.
@@ -92,7 +95,7 @@ def delegate_tools(
         await params.result_callback({"task_id": task_id, "note": note})
 
     async def stop_task(params: FunctionCallParams, task_id: int):
-        """Stop a task that is still running.
+        """Stop a task that is still running ("stop that").
 
         Args:
             task_id: The task to stop.
@@ -102,7 +105,8 @@ def delegate_tools(
         await params.result_callback({"task_id": task_id, "stopped": stopped})
 
     async def remember(params: FunctionCallParams, fact: str):
-        """Remember a lasting fact about the user ("prefers pull requests").
+        """Remember a lasting fact about the user ("prefers pull requests"), when they tell
+        you one. Not for questions about what you know: recall.
 
         Args:
             fact: The fact, as a short sentence.
@@ -110,8 +114,9 @@ def delegate_tools(
         await params.result_callback({"remembered": memory.remember(fact) or "already known"})
 
     async def recall(params: FunctionCallParams, about: str = ""):
-        """What Alfred knows about the user and what happened before: facts, past task
-        results and conversation summaries.
+        """What Alfred knows about the user and what happened before ("what do you know
+        about…?", "what did we do…?"): facts, past task results and conversation summaries.
+        Not for the user's files: search_files.
 
         Args:
             about: A few words on what to look for; empty for every fact.
@@ -135,7 +140,7 @@ def delegate_tools(
         repeat: str = "",
     ):
         """Set a reminder, timer or alarm: Alfred speaks up when it is due (timers and
-        alarms also ring).
+        alarms also ring). Not for work to do now: do_task.
 
         Args:
             text: What it is for, in a few words ("take the pasta off").
@@ -329,6 +334,17 @@ def delegate_tools(
         list_skills, forget_skill, self_check,
         *([play_music] if music else []), *([calendar, find_emails, read_email] if google else []),
     ]  # fmt: skip
+
+
+def not_set_up(music: Music | None, google: Google | None) -> str:
+    """For the delegate: what isn't connected, so a request for it is answered honestly."""
+    missing = [
+        n for n, on in (("music (Spotify)", music), ("calendar and email", google)) if not on
+    ]
+    if not missing:
+        return ""
+    said = " and ".join(missing)
+    return f"\n\n## Not set up yet\n{said[0].upper()}{said[1:]}: if asked, say so."
 
 
 async def account_call(call, service: str):
